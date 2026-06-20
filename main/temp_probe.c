@@ -223,9 +223,9 @@ static void publish_fault_state(uint8_t fault_raw)
     esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ESP_ZB_ZCL_ATTR_BINARY_INPUT_STATUS_FLAGS_ID, &status_flag, false);
-    esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT, TP_DIAG_CLUSTER_ID,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 TP_DIAG_ATTR_FAULT_RAW, &fault_raw, false);
+    esp_zb_zcl_set_manufacturer_attribute_val(HA_TEMP_SENSOR_ENDPOINT, TP_DIAG_CLUSTER_ID,
+                                              ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, TP_MANUF_CODE,
+                                              TP_DIAG_ATTR_FAULT_RAW, &fault_raw, false);
 
     if (fault_active) {
         ESP_LOGW(TAG, "MAX31865 fault: 0x%02x%s%s%s%s%s%s", fault_raw,
@@ -448,26 +448,38 @@ static esp_zb_ep_list_t *build_endpoint(void)
                             ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, bi_desc);
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_binary_input_cluster(clusters, bi, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
-    /* Manufacturer diagnostics cluster: detailed fault byte + capabilities. */
+    /* Manufacturer diagnostics cluster: detailed fault byte + capabilities.
+     * 0xFC00 is in the manufacturer-specific cluster range, so the attributes
+     * MUST be registered manufacturer-specific (under TP_MANUF_CODE) — that is
+     * how Zigbee2MQTT/zigbee-herdsman frames reads and writes to this cluster.
+     * Registering them plain makes every read return nothing and every write
+     * fail with NOT_AUTHORIZED. */
     esp_zb_attribute_list_t *diag = esp_zb_zcl_attr_list_create(TP_DIAG_CLUSTER_ID);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_FAULT_RAW, ESP_ZB_ZCL_ATTR_TYPE_8BITMAP,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                          &s_diag_fault_raw);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_RTD_WIRES, ESP_ZB_ZCL_ATTR_TYPE_U8,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_wires);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_RTD_NOMINAL, ESP_ZB_ZCL_ATTR_TYPE_U16,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_nominal);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_RTD_REF, ESP_ZB_ZCL_ATTR_TYPE_U16,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_ref);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_FILTER_50HZ, ESP_ZB_ZCL_ATTR_TYPE_BOOL,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_filter50);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_SAMPLE_MS, ESP_ZB_ZCL_ATTR_TYPE_U16,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_sample_ms);
+    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_FAULT_RAW, TP_MANUF_CODE,
+                                         ESP_ZB_ZCL_ATTR_TYPE_8BITMAP,
+                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
+                                         &s_diag_fault_raw);
+    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_RTD_WIRES, TP_MANUF_CODE,
+                                         ESP_ZB_ZCL_ATTR_TYPE_U8,
+                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_wires);
+    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_RTD_NOMINAL, TP_MANUF_CODE,
+                                         ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_nominal);
+    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_RTD_REF, TP_MANUF_CODE,
+                                         ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_ref);
+    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_FILTER_50HZ, TP_MANUF_CODE,
+                                         ESP_ZB_ZCL_ATTR_TYPE_BOOL,
+                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_filter50);
+    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_SAMPLE_MS, TP_MANUF_CODE,
+                                         ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_sample_ms);
     /* Writable: select antenna over Zigbee (1 = external U.FL, 0 = ceramic).
      * Seeded with the persisted/boot value so a read reflects reality. */
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_ANTENNA, ESP_ZB_ZCL_ATTR_TYPE_BOOL,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                          &s_diag_antenna_ext);
+    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_ANTENNA, TP_MANUF_CODE,
+                                         ESP_ZB_ZCL_ATTR_TYPE_BOOL,
+                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
+                                         &s_diag_antenna_ext);
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(clusters, diag, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();

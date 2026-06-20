@@ -18,10 +18,15 @@ export default {
     vendor: 'Mechination',
     description: 'PT100 RTD temperature probe (ESP32-C6 + MAX31865) with fault reporting',
     extend: [
-        // Manufacturer diagnostics/control cluster 0xFC00. Attributes are plain
-        // (non-manufacturer-specific), matching the firmware registration.
+        // Manufacturer diagnostics/control cluster 0xFC00. 0xFC00 is in the
+        // manufacturer-specific cluster range, so reads/writes are framed with
+        // the manufacturer code (0x1037) — this MUST match how the firmware
+        // registers the attributes (esp_zb_cluster_add_manufacturer_attr with
+        // TP_MANUF_CODE). Without it, reads return nothing and writes fail with
+        // NOT_AUTHORIZED.
         m.deviceAddCustomCluster('mechinationDiag', {
             ID: 0xfc00,
+            manufacturerCode: 0x1037,
             attributes: {
                 faultRaw: {ID: 0x0000, type: Zcl.DataType.BITMAP8},
                 rtdWires: {ID: 0x0010, type: Zcl.DataType.UINT8},
