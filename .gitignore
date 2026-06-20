@@ -1,0 +1,8 @@
+.cache/
+sdkconfig
+build/
+temp_probe_zigbee/KiCAD-Libs
+temp_probe_zigbee/~*
+temp_probe_zigbee/_autosave*
+managed_components/
+.DS_Store

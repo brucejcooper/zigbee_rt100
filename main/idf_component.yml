@@ -1,0 +1,11 @@
+## IDF Component Manager Manifest File
+dependencies:
+  espressif/esp-zboss-lib: "~1.6.0"
+  espressif/esp-zigbee-lib: "~1.6.0"
+  ## Required IDF version
+  idf:
+    version: ">=5.3.0"
+  ## Helper that adds Basic-cluster manufacturer/model attributes to an endpoint.
+  ## Ships with ESP-IDF, pulled in by path so we don't reimplement it here.
+  examples_utils:
+    path: ${IDF_PATH}/examples/zigbee/zb_common_components/examples_utils

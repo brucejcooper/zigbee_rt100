@@ -1,0 +1,137 @@
+menu "Temperature Probe (MAX31865 + Zigbee)"
+
+    menu "SPI / wiring (XIAO ESP32-C6)"
+        config TP_SPI_SCLK_GPIO
+            int "SCLK GPIO (D8)"
+            default 19
+        config TP_SPI_MISO_GPIO
+            int "MISO GPIO (D9)"
+            default 20
+        config TP_SPI_MOSI_GPIO
+            int "MOSI GPIO (D10)"
+            default 18
+        config TP_SPI_CS_GPIO
+            int "MAX31865 CS GPIO (D7)"
+            default 17
+        config TP_SPI_CLOCK_HZ
+            int "SPI clock (Hz)"
+            default 1000000
+            help
+                MAX31865 supports up to 5 MHz. 1 MHz is conservative and reliable
+                on long breakout jumpers.
+    endmenu
+
+    menu "External antenna (XIAO ESP32-C6 RF switch)"
+        config TP_USE_EXTERNAL_ANTENNA
+            bool "Use the external (U.FL) antenna"
+            default n
+            help
+                The XIAO ESP32-C6 has an on-board RF switch. GPIO3 must be driven
+                LOW to power the switch, then GPIO14 selects the antenna
+                (LOW = on-board ceramic, HIGH = external U.FL).
+        config TP_ANT_RF_SWITCH_EN_GPIO
+            int "RF switch power-enable GPIO (active LOW)"
+            default 3
+        config TP_ANT_SELECT_GPIO
+            int "Antenna select GPIO (HIGH = external)"
+            default 14
+    endmenu
+
+    menu "RTD / sensor"
+        choice TP_RTD_TYPE
+            prompt "RTD type"
+            default TP_RTD_PT100
+            config TP_RTD_PT100
+                bool "PT100 (100 ohm)"
+            config TP_RTD_PT1000
+                bool "PT1000 (1000 ohm)"
+        endchoice
+
+        config TP_RTD_NOMINAL_OHMS
+            int "RTD nominal resistance at 0 C (ohms)"
+            default 100 if TP_RTD_PT100
+            default 1000 if TP_RTD_PT1000
+
+        config TP_RTD_REF_OHMS
+            int "Reference resistor Rref (ohms)"
+            default 430 if TP_RTD_PT100
+            default 4300 if TP_RTD_PT1000
+            help
+                Adafruit PT100 breakout = 430 ohm, PT1000 breakout = 4300 ohm.
+
+        choice TP_RTD_WIRES
+            prompt "RTD wiring"
+            default TP_RTD_3WIRE
+            config TP_RTD_2WIRE
+                bool "2-wire"
+            config TP_RTD_3WIRE
+                bool "3-wire"
+            config TP_RTD_4WIRE
+                bool "4-wire"
+        endchoice
+
+        config TP_RTD_FILTER_50HZ
+            bool "50 Hz mains filter (disable for 60 Hz regions)"
+            default y
+            help
+                Enable for 50 Hz mains (Australia/EU), disable for 60 Hz.
+    endmenu
+
+    menu "Sampling & reporting"
+        config TP_SAMPLE_PERIOD_MS
+            int "Local sample period (ms)"
+            default 250
+            range 50 60000
+            help
+                How often the firmware reads the MAX31865 and updates the Zigbee
+                MeasuredValue attribute. Can be sub-second.
+
+        config TP_REPORT_MIN_INTERVAL_S
+            int "Default report MIN interval (s)"
+            default 1
+            range 0 65534
+            help
+                Default minimum seconds between change-driven reports. This is the
+                fastest the *standard* Zigbee reporting mechanism can go (1 s
+                floor, whole seconds only). A coordinator can override it at
+                runtime with a Configure Reporting command.
+
+        config TP_REPORT_MAX_INTERVAL_S
+            int "Default report MAX interval (s)"
+            default 10
+            range 0 65534
+            help
+                Report at least this often even if the value hasn't changed
+                (heartbeat). 0 disables periodic reporting (report on change only).
+
+        config TP_REPORT_DELTA_CENTIDEG
+            int "Reportable change (1/100 C)"
+            default 20
+            help
+                Minimum change in MeasuredValue (units of 0.01 C) that triggers a
+                report. 20 = 0.2 C.
+
+        config TP_ANTENNA_AB_TEST
+            bool "Run antenna A/B RSSI self-test at boot (diagnostic)"
+            default n
+            help
+                When enabled, after joining the network the device cycles between
+                the external and on-board antennas a few times, stimulating
+                traffic and logging the average received RSSI/LQI for each. Use
+                to quantify the antenna difference, then disable for production.
+
+        config TP_FAST_REPORT_PERIOD_MS
+            int "Fast push-report period (ms, 0 = off)"
+            default 0
+            range 0 60000
+            help
+                Optional. Standard Zigbee reporting is capped at one report per
+                second. Set this > 0 to additionally push an unsolicited
+                Report Attributes command at this period (e.g. 200 ms = 5 Hz),
+                bypassing the 1 s floor. Reports go to whatever is bound to the
+                Temperature Measurement cluster (typically the coordinator).
+                Leave at 0 to rely solely on standard, client-configurable
+                reporting.
+    endmenu
+
+endmenu
