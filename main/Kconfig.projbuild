@@ -37,6 +37,20 @@ menu "Temperature Probe (MAX31865 + Zigbee)"
             default 14
     endmenu
 
+    menu "Factory-reset button"
+        config TP_FACTORY_RESET_GPIO
+            int "Factory-reset button GPIO (active LOW)"
+            default 9
+            help
+                GPIO read as an active-LOW pushbutton. Holding it for
+                TP_FACTORY_RESET_HOLD_MS erases the Zigbee NVRAM and reboots the
+                device factory-new so it re-commissions onto a fresh network.
+                Default 9 is the XIAO ESP32-C6 on-board BOOT button.
+        config TP_FACTORY_RESET_HOLD_MS
+            int "Hold time to trigger factory reset (ms)"
+            default 3000
+    endmenu
+
     menu "RTD / sensor"
         choice TP_RTD_TYPE
             prompt "RTD type"

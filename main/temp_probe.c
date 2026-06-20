@@ -223,9 +223,9 @@ static void publish_fault_state(uint8_t fault_raw)
     esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ESP_ZB_ZCL_ATTR_BINARY_INPUT_STATUS_FLAGS_ID, &status_flag, false);
-    esp_zb_zcl_set_manufacturer_attribute_val(HA_TEMP_SENSOR_ENDPOINT, TP_DIAG_CLUSTER_ID,
-                                              ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, TP_MANUF_CODE,
-                                              TP_DIAG_ATTR_FAULT_RAW, &fault_raw, false);
+    esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT, TP_DIAG_CLUSTER_ID,
+                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                 TP_DIAG_ATTR_FAULT_RAW, &fault_raw, false);
 
     if (fault_active) {
         ESP_LOGW(TAG, "MAX31865 fault: 0x%02x%s%s%s%s%s%s", fault_raw,
@@ -455,35 +455,27 @@ static esp_zb_ep_list_t *build_endpoint(void)
      * Registering them plain makes every read return nothing and every write
      * fail with NOT_AUTHORIZED. */
     esp_zb_attribute_list_t *diag = esp_zb_zcl_attr_list_create(TP_DIAG_CLUSTER_ID);
-    /* No REPORTING flag: nothing configures reporting info for the diag cluster,
-     * and the manufacturer-aware report path crashes when a value is set on a
-     * REPORTING attribute with no matching reporting info. z2m reads these on
-     * demand (STATE_GET); the live fault alarm reports via genBinaryInput. */
-    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_FAULT_RAW, TP_MANUF_CODE,
-                                         ESP_ZB_ZCL_ATTR_TYPE_8BITMAP,
-                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-                                         &s_diag_fault_raw);
-    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_RTD_WIRES, TP_MANUF_CODE,
-                                         ESP_ZB_ZCL_ATTR_TYPE_U8,
-                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_wires);
-    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_RTD_NOMINAL, TP_MANUF_CODE,
-                                         ESP_ZB_ZCL_ATTR_TYPE_U16,
-                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_nominal);
-    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_RTD_REF, TP_MANUF_CODE,
-                                         ESP_ZB_ZCL_ATTR_TYPE_U16,
-                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_ref);
-    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_FILTER_50HZ, TP_MANUF_CODE,
-                                         ESP_ZB_ZCL_ATTR_TYPE_BOOL,
-                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_filter50);
-    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_SAMPLE_MS, TP_MANUF_CODE,
-                                         ESP_ZB_ZCL_ATTR_TYPE_U16,
-                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_sample_ms);
-    /* Writable: select antenna over Zigbee (1 = external U.FL, 0 = ceramic).
-     * Seeded with the persisted/boot value so a read reflects reality. */
-    esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_ANTENNA, TP_MANUF_CODE,
-                                         ESP_ZB_ZCL_ATTR_TYPE_BOOL,
-                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
-                                         &s_diag_antenna_ext);
+    /* Plain (non-manufacturer) custom attributes — this is the canonical pattern
+     * and, crucially, what gets the cluster emitted into the simple descriptor.
+     * A custom cluster whose attributes are ALL manufacturer-specific is dropped
+     * from the descriptor (z2m then reports "has no input cluster"). No REPORTING
+     * flag: nothing configures reporting info here; z2m reads these on demand
+     * (STATE_GET) and the live fault alarm reports via genBinaryInput. */
+    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_FAULT_RAW, ESP_ZB_ZCL_ATTR_TYPE_8BITMAP,
+                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_fault_raw);
+    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_RTD_WIRES, ESP_ZB_ZCL_ATTR_TYPE_U8,
+                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_wires);
+    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_RTD_NOMINAL, ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_nominal);
+    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_RTD_REF, ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_ref);
+    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_FILTER_50HZ, ESP_ZB_ZCL_ATTR_TYPE_BOOL,
+                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_filter50);
+    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_SAMPLE_MS, ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_sample_ms);
+    /* Writable: select antenna over Zigbee (1 = external U.FL, 0 = ceramic). */
+    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_ANTENNA, ESP_ZB_ZCL_ATTR_TYPE_BOOL,
+                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &s_diag_antenna_ext);
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(clusters, diag, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
@@ -591,12 +583,60 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 }
 
 /* ------------------------------------------------------------------------- */
+/* Factory-reset pushbutton: hold the active-LOW button (XIAO BOOT/GPIO9 by    */
+/* default) for CONFIG_TP_FACTORY_RESET_HOLD_MS, then release, to erase the     */
+/* Zigbee NVRAM and reboot factory-new so the device re-commissions cleanly.    */
+/* Triggering on release (not while held) avoids re-entering the bootloader     */
+/* download mode via the GPIO9 strapping pin during the reboot.                 */
+/* ------------------------------------------------------------------------- */
+static void factory_reset_button_task(void *arg)
+{
+    const gpio_num_t pin = CONFIG_TP_FACTORY_RESET_GPIO;
+    const int poll_ms = 50;
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+
+    int held_ms = 0;
+    bool announced = false;
+    while (1) {
+        if (gpio_get_level(pin) == 0) {            /* pressed (active LOW) */
+            held_ms += poll_ms;
+            if (held_ms >= CONFIG_TP_FACTORY_RESET_HOLD_MS && !announced) {
+                announced = true;
+                ESP_LOGW(TAG, "Factory-reset threshold reached; release button to erase & reboot");
+            }
+        } else {
+            if (held_ms >= CONFIG_TP_FACTORY_RESET_HOLD_MS) {
+                ESP_LOGW(TAG, "Factory reset: erasing Zigbee NVRAM and rebooting");
+                esp_zb_factory_reset();            /* erases NVRAM + reboots */
+            }
+            held_ms = 0;
+            announced = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(poll_ms));
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 /* Zigbee main task                                                            */
 /* ------------------------------------------------------------------------- */
 static void esp_zb_task(void *pvParameters)
 {
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZR_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
+
+    /* Advertise our manufacturer code in the node descriptor so it matches the
+     * code the manufacturer-specific diag attributes are registered under (and
+     * that z2m frames reads/writes with). Without this the device defaults to
+     * Espressif's 0x131B, mismatching TP_MANUF_CODE, and every manufacturer-
+     * specific read/write to the 0xFC00 cluster is silently rejected. */
+    esp_zb_set_node_descriptor_manufacturer_code(TP_MANUF_CODE);
 
     esp_zb_ep_list_t *ep_list = build_endpoint();
 
@@ -612,6 +652,7 @@ static void esp_zb_task(void *pvParameters)
 
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
+    xTaskCreate(factory_reset_button_task, "fct_btn", 2560, NULL, 4, NULL);
     esp_zb_stack_main_loop();
 }
 
