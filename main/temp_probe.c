@@ -455,9 +455,13 @@ static esp_zb_ep_list_t *build_endpoint(void)
      * Registering them plain makes every read return nothing and every write
      * fail with NOT_AUTHORIZED. */
     esp_zb_attribute_list_t *diag = esp_zb_zcl_attr_list_create(TP_DIAG_CLUSTER_ID);
+    /* No REPORTING flag: nothing configures reporting info for the diag cluster,
+     * and the manufacturer-aware report path crashes when a value is set on a
+     * REPORTING attribute with no matching reporting info. z2m reads these on
+     * demand (STATE_GET); the live fault alarm reports via genBinaryInput. */
     esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_FAULT_RAW, TP_MANUF_CODE,
                                          ESP_ZB_ZCL_ATTR_TYPE_8BITMAP,
-                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
+                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
                                          &s_diag_fault_raw);
     esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_RTD_WIRES, TP_MANUF_CODE,
                                          ESP_ZB_ZCL_ATTR_TYPE_U8,
@@ -478,7 +482,7 @@ static esp_zb_ep_list_t *build_endpoint(void)
      * Seeded with the persisted/boot value so a read reflects reality. */
     esp_zb_cluster_add_manufacturer_attr(diag, TP_DIAG_CLUSTER_ID, TP_DIAG_ATTR_ANTENNA, TP_MANUF_CODE,
                                          ESP_ZB_ZCL_ATTR_TYPE_BOOL,
-                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
+                                         ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
                                          &s_diag_antenna_ext);
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(clusters, diag, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
