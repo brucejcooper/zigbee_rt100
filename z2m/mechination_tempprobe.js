@@ -30,6 +30,11 @@ export default {
         // parsing read responses. Omitting it makes reads come back keyed
         // "undefined" and leaves every expose null.
         m.deviceAddCustomCluster('mechinationDiag', {
+            // `name` MUST be set here too — herdsman uses the definition's `name`
+            // as the cluster's name when parsing device messages. Without it the
+            // cluster resolves with name `undefined`, so the fromZigbee converters
+            // (keyed cluster: 'mechinationDiag') never match and exposes stay null.
+            name: 'mechinationDiag',
             ID: 0xfc00,
             attributes: {
                 faultRaw: {name: 'faultRaw', ID: 0x0000, type: Zcl.DataType.BITMAP8},
