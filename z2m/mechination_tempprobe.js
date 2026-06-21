@@ -49,8 +49,11 @@ export default {
             commandsResponse: {},
         }),
 
-        // Primary measurement.
-        m.temperature(),
+        // Primary measurement. Override the default reporting (change: 100 = 1 °C,
+        // max 1 h) so z2m configures the device for fine 0.05 °C steps to match the
+        // firmware default. change is in raw centidegrees (5 = 0.05 °C); min 10 s
+        // throttles bursts, max 5 min gives a periodic heartbeat when stable.
+        m.temperature({reporting: {min: '10_SECONDS', max: '5_MINUTES', change: 5}}),
 
         // RTD fault flag — pushed by the device (standard Binary Input cluster).
         m.binary({
