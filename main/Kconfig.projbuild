@@ -120,10 +120,10 @@ menu "Temperature Probe (MAX31865 + Zigbee)"
 
         config TP_REPORT_DELTA_CENTIDEG
             int "Reportable change (1/100 C)"
-            default 20
+            default 5
             help
                 Minimum change in MeasuredValue (units of 0.01 C) that triggers a
-                report. 20 = 0.2 C.
+                report. 5 = 0.05 C.
 
         config TP_ANTENNA_AB_TEST
             bool "Run antenna A/B RSSI self-test at boot (diagnostic)"
