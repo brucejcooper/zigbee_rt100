@@ -25,16 +25,20 @@ export default {
         // advertised in the simple descriptor and z2m frames reads/writes plain.
         // Do NOT add a manufacturerCode here — it must match the firmware, which
         // uses esp_zb_custom_cluster_add_custom_attr (no manufacturer code).
+        // Each attribute MUST carry an explicit `name` field — herdsman uses it
+        // (not the JS object key) for the attribute-ID→name reverse lookup when
+        // parsing read responses. Omitting it makes reads come back keyed
+        // "undefined" and leaves every expose null.
         m.deviceAddCustomCluster('mechinationDiag', {
             ID: 0xfc00,
             attributes: {
-                faultRaw: {ID: 0x0000, type: Zcl.DataType.BITMAP8},
-                rtdWires: {ID: 0x0010, type: Zcl.DataType.UINT8},
-                rtdNominalOhm: {ID: 0x0011, type: Zcl.DataType.UINT16},
-                rtdRefOhm: {ID: 0x0012, type: Zcl.DataType.UINT16},
-                filter50hz: {ID: 0x0013, type: Zcl.DataType.BOOLEAN},
-                samplePeriodMs: {ID: 0x0014, type: Zcl.DataType.UINT16},
-                antenna: {ID: 0x0020, type: Zcl.DataType.BOOLEAN},
+                faultRaw: {name: 'faultRaw', ID: 0x0000, type: Zcl.DataType.BITMAP8},
+                rtdWires: {name: 'rtdWires', ID: 0x0010, type: Zcl.DataType.UINT8},
+                rtdNominalOhm: {name: 'rtdNominalOhm', ID: 0x0011, type: Zcl.DataType.UINT16},
+                rtdRefOhm: {name: 'rtdRefOhm', ID: 0x0012, type: Zcl.DataType.UINT16},
+                filter50hz: {name: 'filter50hz', ID: 0x0013, type: Zcl.DataType.BOOLEAN},
+                samplePeriodMs: {name: 'samplePeriodMs', ID: 0x0014, type: Zcl.DataType.UINT16},
+                antenna: {name: 'antenna', ID: 0x0020, type: Zcl.DataType.BOOLEAN, write: true},
             },
             commands: {},
             commandsResponse: {},
