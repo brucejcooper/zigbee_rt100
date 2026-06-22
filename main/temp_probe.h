@@ -49,8 +49,8 @@ extern "C" {
 #define TP_DIAG_ATTR_RTD_NOMINAL 0x0011 /* u16: nominal RTD ohms (100/1000)     */
 #define TP_DIAG_ATTR_RTD_REF     0x0012 /* u16: reference resistor ohms         */
 #define TP_DIAG_ATTR_FILTER_50HZ 0x0013 /* bool: mains notch filter is 50 Hz    */
-#define TP_DIAG_ATTR_SAMPLE_MS   0x0014 /* u16: local sample period in ms       */
 #define TP_DIAG_ATTR_ANTENNA     0x0020 /* bool R/W: 1=external U.FL, 0=ceramic  */
+#define TP_DIAG_ATTR_EMA_ALPHA   0x0021 /* u16 R/W: EMA smoothing alpha x1000    */
 
 /* Mains-powered Router role configuration. */
 #define ESP_ZB_ZR_CONFIG()                              \

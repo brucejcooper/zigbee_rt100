@@ -59,7 +59,12 @@ static uint8_t  s_diag_wires     = TP_WIRE_COUNT;
 static uint16_t s_diag_nominal   = CONFIG_TP_RTD_NOMINAL_OHMS;
 static uint16_t s_diag_ref       = CONFIG_TP_RTD_REF_OHMS;
 static bool     s_diag_filter50  = CONFIG_TP_RTD_FILTER_50HZ;
-static uint16_t s_diag_sample_ms = CONFIG_TP_SAMPLE_PERIOD_MS;
+
+/* EMA smoothing weight, exposed over Zigbee as alpha x 1000 (the backing store
+ * for the R/W diag attribute) and cached as a float for the sampling loop. A
+ * Zigbee write overrides the Kconfig power-on default and is persisted to NVS. */
+static uint16_t s_diag_ema_permille = CONFIG_TP_EMA_ALPHA_PERMILLE;
+static float    s_ema_alpha         = CONFIG_TP_EMA_ALPHA_PERMILLE / 1000.0f;
 
 /* Antenna selection (true = external U.FL, false = on-board ceramic). The Kconfig
  * value is the power-on default; a Zigbee write to TP_DIAG_ATTR_ANTENNA overrides
@@ -71,6 +76,7 @@ static uint16_t s_diag_sample_ms = CONFIG_TP_SAMPLE_PERIOD_MS;
 #endif
 #define TP_NVS_NAMESPACE "tempprobe"
 #define TP_NVS_KEY_ANT   "ant_ext"
+#define TP_NVS_KEY_EMA   "ema_a"
 static bool s_diag_antenna_ext = TP_ANTENNA_DEFAULT; /* backing store for the attr */
 
 /* ------------------------------------------------------------------------- */
@@ -101,6 +107,47 @@ static void antenna_save_pref(bool external)
         nvs_commit(h);
         nvs_close(h);
     }
+}
+
+/* ------------------------------------------------------------------------- */
+/* EMA smoothing weight: load the persisted alpha (alpha x 1000) at boot,      */
+/* persist runtime changes, and keep the float cache in sync. Clamped to       */
+/* [1, 1000] so the filter can never freeze (alpha=0) and 1000 means raw.      */
+/* ------------------------------------------------------------------------- */
+static uint16_t ema_clamp(uint16_t permille)
+{
+    if (permille < 1)    return 1;
+    if (permille > 1000) return 1000;
+    return permille;
+}
+
+static void ema_alpha_load(void)
+{
+    uint16_t permille = CONFIG_TP_EMA_ALPHA_PERMILLE;
+    nvs_handle_t h;
+    if (nvs_open(TP_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        uint16_t stored = 0;
+        if (nvs_get_u16(h, TP_NVS_KEY_EMA, &stored) == ESP_OK) {
+            permille = stored;
+        }
+        nvs_close(h);
+    }
+    s_diag_ema_permille = ema_clamp(permille);
+    s_ema_alpha = s_diag_ema_permille / 1000.0f;
+}
+
+static void ema_alpha_set(uint16_t permille)
+{
+    s_diag_ema_permille = ema_clamp(permille);
+    s_ema_alpha = s_diag_ema_permille / 1000.0f;
+    nvs_handle_t h;
+    if (nvs_open(TP_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u16(h, TP_NVS_KEY_EMA, s_diag_ema_permille);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "EMA alpha set to %.3f (%u/1000) via Zigbee (persisted)",
+             s_ema_alpha, s_diag_ema_permille);
 }
 
 /* Drive GPIO14 to the requested antenna. GPIO3 is held low (switch powered). */
@@ -291,8 +338,9 @@ static void sensor_task(void *arg)
 #endif
 
 #if CONFIG_TP_DRDY_GPIO >= 0
-    /* Interrupt-driven acquisition: oversample every conversion (~tens/s) and
-     * publish the block average once per window, cutting noise by ~sqrt(N). */
+    /* Interrupt-driven acquisition: run an exponential moving average over every
+     * conversion (~tens/s) so the MeasuredValue is continuously smoothed and
+     * always fresh; publish the current EMA on the slower cadence below. */
     s_sensor_task = xTaskGetCurrentTaskHandle();
     gpio_config_t drdy = {
         .pin_bit_mask = 1ULL << CONFIG_TP_DRDY_GPIO,
@@ -309,36 +357,41 @@ static void sensor_task(void *arg)
     ESP_ERROR_CHECK(gpio_isr_handler_add(CONFIG_TP_DRDY_GPIO, drdy_isr, NULL));
 #endif
 
-    double sum = 0.0;
-    uint32_t count = 0;
+    double ema = 0.0;
+    bool ema_valid = false;
     int64_t last_emit = esp_timer_get_time();
 
     for (;;) {
-        /* Block until the next conversion (DRDY). The timeout doubles as the
-         * publish-window fallback, so a stalled DRDY can't wedge reporting
-         * (it degrades to one sample per window). */
+        /* Block until the next conversion (DRDY). The timeout doubles as a
+         * stalled-DRDY fallback, so reporting can't wedge (it degrades to one
+         * read per publish period). */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CONFIG_TP_SAMPLE_PERIOD_MS));
 
         float temp_c = 0.0f;
         if (max31865_read_temperature(s_rtd, &temp_c) == ESP_OK) {
-            sum += temp_c;
-            count++;
+            /* y += alpha*(x - y). Seed on the first good sample to avoid a long
+             * ramp from zero. A read error (fault) just holds the current EMA. */
+            if (!ema_valid) {
+                ema = temp_c;
+                ema_valid = true;
+            } else {
+                ema += (double)s_ema_alpha * ((double)temp_c - ema);
+            }
         }
 
         if (esp_timer_get_time() - last_emit < window_us) {
-            continue;   /* keep oversampling until the window elapses */
+            continue;   /* keep integrating until the publish period elapses */
         }
         last_emit = esp_timer_get_time();
 
-        /* Window boundary: read the detailed fault register and publish the
-         * averaged MeasuredValue + fault state. */
+        /* Publish boundary: read the detailed fault register and push the
+         * current smoothed MeasuredValue + fault state. */
         uint8_t fault_raw = 0;
         max31865_read_fault(s_rtd, &fault_raw);
 
         esp_zb_lock_acquire(portMAX_DELAY);
-        if (count > 0) {
-            float avg = (float)(sum / (double)count);
-            int16_t centi = (int16_t)lroundf(avg * 100.0f);
+        if (ema_valid) {
+            int16_t centi = (int16_t)lroundf((float)ema * 100.0f);
             esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT,
                                          ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
                                          ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
@@ -358,9 +411,10 @@ static void sensor_task(void *arg)
                 esp_zb_zcl_report_attr_cmd_req(&report);
             }
 #endif
-            ESP_LOGD(TAG, "RTD avg=%.3f C n=%u (MeasuredValue=%d)", avg, (unsigned)count, centi);
+            ESP_LOGD(TAG, "RTD EMA=%.3f C alpha=%.3f (MeasuredValue=%d)",
+                     ema, s_ema_alpha, centi);
         } else {
-            ESP_LOGW(TAG, "No RTD samples this window (DRDY stalled or fault); holding last value");
+            ESP_LOGW(TAG, "No RTD samples yet (DRDY stalled or fault); holding last value");
         }
         publish_fault_state(fault_raw);
         esp_zb_lock_release();
@@ -369,8 +423,6 @@ static void sensor_task(void *arg)
         if (fault_raw != 0) {
             max31865_clear_fault(s_rtd);
         }
-        sum = 0.0;
-        count = 0;
     }
 }
 
@@ -521,8 +573,9 @@ static esp_zb_ep_list_t *build_endpoint(void)
                                           ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_ref);
     esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_FILTER_50HZ, ESP_ZB_ZCL_ATTR_TYPE_BOOL,
                                           ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_filter50);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_SAMPLE_MS, ESP_ZB_ZCL_ATTR_TYPE_U16,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_sample_ms);
+    /* Writable: EMA smoothing weight (alpha x 1000, 1..1000). */
+    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_EMA_ALPHA, ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &s_diag_ema_permille);
     /* Writable: select antenna over Zigbee (1 = external U.FL, 0 = ceramic). */
     esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_ANTENNA, ESP_ZB_ZCL_ATTR_TYPE_BOOL,
                                           ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &s_diag_antenna_ext);
@@ -613,10 +666,14 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 
     if (message->info.dst_endpoint == HA_TEMP_SENSOR_ENDPOINT &&
         message->info.cluster == TP_DIAG_CLUSTER_ID &&
-        message->attribute.id == TP_DIAG_ATTR_ANTENNA &&
-        message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL &&
         message->attribute.data.value) {
-        antenna_set(*(bool *)message->attribute.data.value);
+        if (message->attribute.id == TP_DIAG_ATTR_ANTENNA &&
+            message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL) {
+            antenna_set(*(bool *)message->attribute.data.value);
+        } else if (message->attribute.id == TP_DIAG_ATTR_EMA_ALPHA &&
+                   message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U16) {
+            ema_alpha_set(*(uint16_t *)message->attribute.data.value);
+        }
     }
     return ESP_OK;
 }
@@ -709,6 +766,9 @@ static void esp_zb_task(void *pvParameters)
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    /* Load persisted settings before the endpoint is registered / radio is up. */
+    ema_alpha_load();
 
     /* Antenna routing must be set before the radio comes up. */
     configure_antenna();

@@ -100,12 +100,25 @@ menu "Temperature Probe (MAX31865 + Zigbee)"
 
     menu "Sampling & reporting"
         config TP_SAMPLE_PERIOD_MS
-            int "Local sample period (ms)"
+            int "MeasuredValue publish period (ms)"
             default 250
             range 50 60000
             help
-                How often the firmware reads the MAX31865 and updates the Zigbee
-                MeasuredValue attribute. Can be sub-second.
+                How often the firmware pushes the current (EMA-smoothed) reading
+                into the Zigbee MeasuredValue attribute. The exponential filter
+                itself runs on every MAX31865 conversion (DRDY-driven, ~50/s);
+                this is only the publish/refresh cadence, not an averaging window.
+
+        config TP_EMA_ALPHA_PERMILLE
+            int "EMA smoothing alpha (x1000)"
+            default 400
+            range 1 1000
+            help
+                Exponential moving-average weight applied to each conversion:
+                y += alpha*(x - y). Stored as alpha x 1000, so 400 = 0.40.
+                Lower = smoother but laggier; 1000 = no smoothing (raw). This is
+                the power-on default; it is writable over Zigbee (diagnostics
+                cluster) and the runtime value is persisted to NVS.
 
         config TP_REPORT_MIN_INTERVAL_S
             int "Default report MIN interval (s)"

@@ -42,8 +42,8 @@ export default {
                 rtdNominalOhm: {name: 'rtdNominalOhm', ID: 0x0011, type: Zcl.DataType.UINT16},
                 rtdRefOhm: {name: 'rtdRefOhm', ID: 0x0012, type: Zcl.DataType.UINT16},
                 filter50hz: {name: 'filter50hz', ID: 0x0013, type: Zcl.DataType.BOOLEAN},
-                samplePeriodMs: {name: 'samplePeriodMs', ID: 0x0014, type: Zcl.DataType.UINT16},
                 antenna: {name: 'antenna', ID: 0x0020, type: Zcl.DataType.BOOLEAN, write: true},
+                emaAlpha: {name: 'emaAlpha', ID: 0x0021, type: Zcl.DataType.UINT16, write: true},
             },
             commands: {},
             commandsResponse: {},
@@ -125,14 +125,21 @@ export default {
             description: 'Mains rejection notch filter frequency',
             entityCategory: 'diagnostic',
         }),
+        // EMA smoothing weight — writable, persisted on the device. Stored on the
+        // wire as alpha x 1000 (UINT16); `scale: 1000` presents it as 0.01–1.00.
+        // Lower = smoother but laggier; 1.00 = no smoothing (raw conversions).
         m.numeric({
-            name: 'sample_period',
+            name: 'smoothing_alpha',
             cluster: 'mechinationDiag',
-            attribute: 'samplePeriodMs',
-            unit: 'ms',
-            access: 'STATE_GET',
-            description: 'Local RTD sampling period',
-            entityCategory: 'diagnostic',
+            attribute: 'emaAlpha',
+            access: 'ALL',
+            scale: 1000,
+            valueMin: 0.01,
+            valueMax: 1,
+            valueStep: 0.01,
+            precision: 2,
+            description: 'EMA weight per conversion: lower = smoother/laggier, 1.00 = raw (persisted on device)',
+            entityCategory: 'config',
         }),
 
         m.identify(),
