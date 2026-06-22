@@ -19,6 +19,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
 #include "math.h"
 #if CONFIG_TP_ANTENNA_AB_TEST
 #include "esp_ieee802154.h"
@@ -269,26 +270,75 @@ static void publish_fault_state(uint8_t fault_raw)
 /* stack's standard reporting machinery; the optional fast path fires extra      */
 /* unsolicited reports for sub-second publishing.                              */
 /* ------------------------------------------------------------------------- */
+static TaskHandle_t s_sensor_task;
+
+#if CONFIG_TP_DRDY_GPIO >= 0
+/* MAX31865 DRDY (active LOW) fires when each continuous conversion is ready.
+ * Keep the ISR trivial: just wake the sampling task to do the SPI read. */
+static void IRAM_ATTR drdy_isr(void *arg)
+{
+    BaseType_t hpw = pdFALSE;
+    vTaskNotifyGiveFromISR(s_sensor_task, &hpw);
+    portYIELD_FROM_ISR(hpw);
+}
+#endif
+
 static void sensor_task(void *arg)
 {
-    const TickType_t period = pdMS_TO_TICKS(CONFIG_TP_SAMPLE_PERIOD_MS);
+    const int64_t window_us = (int64_t)CONFIG_TP_SAMPLE_PERIOD_MS * 1000;
 #if CONFIG_TP_FAST_REPORT_PERIOD_MS > 0
     uint32_t ms_since_fast_report = 0;
 #endif
 
+#if CONFIG_TP_DRDY_GPIO >= 0
+    /* Interrupt-driven acquisition: oversample every conversion (~tens/s) and
+     * publish the block average once per window, cutting noise by ~sqrt(N). */
+    s_sensor_task = xTaskGetCurrentTaskHandle();
+    gpio_config_t drdy = {
+        .pin_bit_mask = 1ULL << CONFIG_TP_DRDY_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&drdy));
+    esp_err_t isr_err = gpio_install_isr_service(0);
+    if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(isr_err);
+    }
+    ESP_ERROR_CHECK(gpio_isr_handler_add(CONFIG_TP_DRDY_GPIO, drdy_isr, NULL));
+#endif
+
+    double sum = 0.0;
+    uint32_t count = 0;
+    int64_t last_emit = esp_timer_get_time();
+
     for (;;) {
-        /* Read the detailed fault register first; max31865_read_temperature
-         * deliberately leaves a flagged fault latched so we capture it here. */
+        /* Block until the next conversion (DRDY). The timeout doubles as the
+         * publish-window fallback, so a stalled DRDY can't wedge reporting
+         * (it degrades to one sample per window). */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CONFIG_TP_SAMPLE_PERIOD_MS));
+
+        float temp_c = 0.0f;
+        if (max31865_read_temperature(s_rtd, &temp_c) == ESP_OK) {
+            sum += temp_c;
+            count++;
+        }
+
+        if (esp_timer_get_time() - last_emit < window_us) {
+            continue;   /* keep oversampling until the window elapses */
+        }
+        last_emit = esp_timer_get_time();
+
+        /* Window boundary: read the detailed fault register and publish the
+         * averaged MeasuredValue + fault state. */
         uint8_t fault_raw = 0;
         max31865_read_fault(s_rtd, &fault_raw);
 
-        float temp_c = 0.0f;
-        esp_err_t terr = max31865_read_temperature(s_rtd, &temp_c);
-
         esp_zb_lock_acquire(portMAX_DELAY);
-
-        if (terr == ESP_OK) {
-            int16_t centi = (int16_t)lroundf(temp_c * 100.0f);
+        if (count > 0) {
+            float avg = (float)(sum / (double)count);
+            int16_t centi = (int16_t)lroundf(avg * 100.0f);
             esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT,
                                          ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
                                          ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
@@ -308,19 +358,19 @@ static void sensor_task(void *arg)
                 esp_zb_zcl_report_attr_cmd_req(&report);
             }
 #endif
-            ESP_LOGD(TAG, "RTD = %.2f C (MeasuredValue=%d)", temp_c, centi);
+            ESP_LOGD(TAG, "RTD avg=%.3f C n=%u (MeasuredValue=%d)", avg, (unsigned)count, centi);
+        } else {
+            ESP_LOGW(TAG, "No RTD samples this window (DRDY stalled or fault); holding last value");
         }
-
         publish_fault_state(fault_raw);
         esp_zb_lock_release();
 
-        /* Clear so the next cycle re-latches a fresh fault snapshot. In auto
-         * conversion mode any persisting fault re-asserts immediately. */
-        if (fault_raw != 0 || terr == ESP_ERR_INVALID_STATE) {
+        /* Auto conversion mode re-asserts a persisting fault immediately. */
+        if (fault_raw != 0) {
             max31865_clear_fault(s_rtd);
         }
-
-        vTaskDelay(period);
+        sum = 0.0;
+        count = 0;
     }
 }
 

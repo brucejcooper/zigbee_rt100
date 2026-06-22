@@ -11,8 +11,15 @@ menu "Temperature Probe (MAX31865 + Zigbee)"
             int "MOSI GPIO (D10)"
             default 18
         config TP_SPI_CS_GPIO
-            int "MAX31865 CS GPIO (D7)"
-            default 17
+            int "MAX31865 CS GPIO (D5)"
+            default 23
+        config TP_DRDY_GPIO
+            int "MAX31865 DRDY GPIO (D4, active LOW)"
+            default 22
+            help
+                Data-ready signal from the MAX31865. In continuous conversion
+                mode it pulses LOW when a new conversion is available; used for
+                interrupt-driven oversampling. Set to -1 to disable.
         config TP_SPI_CLOCK_HZ
             int "SPI clock (Hz)"
             default 1000000

@@ -25,6 +25,13 @@ CONFIG_ZB_ZCZR=y
 CONFIG_IEEE802154_ENABLED=y
 
 #
+# Console: use the native USB Serial/JTAG as the only console. UART0 (GPIO16/17)
+# carried a duplicate log stream and is not used, so disable it to free those pins.
+#
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+#
 # Main task / logging headroom
 #
 CONFIG_FREERTOS_HZ=1000
