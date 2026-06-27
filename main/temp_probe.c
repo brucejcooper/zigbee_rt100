@@ -359,6 +359,7 @@ static void sensor_task(void *arg)
 
     double ema = 0.0;
     bool ema_valid = false;
+    uint32_t accepted = 0;        /* in-range samples integrated this period */
     int64_t last_emit = esp_timer_get_time();
 
     for (;;) {
@@ -368,15 +369,18 @@ static void sensor_task(void *arg)
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CONFIG_TP_SAMPLE_PERIOD_MS));
 
         float temp_c = 0.0f;
-        if (max31865_read_temperature(s_rtd, &temp_c) == ESP_OK) {
+        if (max31865_read_temperature(s_rtd, &temp_c) == ESP_OK &&
+            temp_c >= TP_RTD_VALID_MIN_C && temp_c <= TP_RTD_VALID_MAX_C) {
             /* y += alpha*(x - y). Seed on the first good sample to avoid a long
-             * ramp from zero. A read error (fault) just holds the current EMA. */
+             * ramp from zero. Faulted or out-of-range reads are dropped here so
+             * a single garbage transition sample can't poison the EMA. */
             if (!ema_valid) {
                 ema = temp_c;
                 ema_valid = true;
             } else {
                 ema += (double)s_ema_alpha * ((double)temp_c - ema);
             }
+            accepted++;
         }
 
         if (esp_timer_get_time() - last_emit < window_us) {
@@ -390,7 +394,7 @@ static void sensor_task(void *arg)
         max31865_read_fault(s_rtd, &fault_raw);
 
         esp_zb_lock_acquire(portMAX_DELAY);
-        if (ema_valid) {
+        if (fault_raw == 0 && accepted > 0) {
             int16_t centi = (int16_t)lroundf((float)ema * 100.0f);
             esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT,
                                          ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
@@ -414,7 +418,18 @@ static void sensor_task(void *arg)
             ESP_LOGD(TAG, "RTD EMA=%.3f C alpha=%.3f (MeasuredValue=%d)",
                      ema, s_ema_alpha, centi);
         } else {
-            ESP_LOGW(TAG, "No RTD samples yet (DRDY stalled or fault); holding last value");
+            /* Faulted, or no trustworthy sample this period: publish the ZCL
+             * invalid sentinel (0x8000) so the value reads as unavailable rather
+             * than a bogus number, and force a clean re-seed on recovery. */
+            int16_t invalid = TP_MEASURED_INVALID;
+            esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT,
+                                         ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+                                         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                         ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+                                         &invalid, false);
+            ema_valid = false;
+            ESP_LOGW(TAG, "RTD unavailable (fault=0x%02x, in-range samples=%u); reporting invalid",
+                     fault_raw, (unsigned)accepted);
         }
         publish_fault_state(fault_raw);
         esp_zb_lock_release();
@@ -423,6 +438,7 @@ static void sensor_task(void *arg)
         if (fault_raw != 0) {
             max31865_clear_fault(s_rtd);
         }
+        accepted = 0;
     }
 }
 

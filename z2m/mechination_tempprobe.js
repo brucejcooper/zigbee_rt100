@@ -53,7 +53,20 @@ export default {
         // max 1 h) so z2m configures the device for fine 0.05 °C steps to match the
         // firmware default. change is in raw centidegrees (5 = 0.05 °C); min 10 s
         // throttles bursts, max 5 min gives a periodic heartbeat when stable.
-        m.temperature({reporting: {min: '10_SECONDS', max: '5_MINUTES', change: 5}}),
+        //
+        // On an RTD fault the firmware publishes the ZCL "invalid" sentinel
+        // (MeasuredValue = 0x8000 = -32768). The stock converter would surface
+        // that as -327.68 °C and wreck graphs/automations, so override fzConvert
+        // to report it as null (unavailable) instead of a bogus number.
+        m.temperature({
+            reporting: {min: '10_SECONDS', max: '5_MINUTES', change: 5},
+            fzConvert: (model, msg) => {
+                const raw = msg.data.measuredValue;
+                if (raw === undefined) return;
+                if (raw === -32768) return {temperature: null}; // 0x8000 = invalid
+                return {temperature: raw / 100};
+            },
+        }),
 
         // RTD fault flag — pushed by the device (standard Binary Input cluster).
         m.binary({

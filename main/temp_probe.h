@@ -33,6 +33,15 @@ extern "C" {
 #define TP_MEASURED_MIN_CENTIDEG (-20000) /* -200.00 C */
 #define TP_MEASURED_MAX_CENTIDEG (32767)  /* +327.67 C (int16 max) */
 
+/* ZCL "invalid/unknown" MeasuredValue sentinel. Published on an RTD fault so the
+ * coordinator surfaces the reading as unavailable instead of a bogus number. */
+#define TP_MEASURED_INVALID      ((int16_t)0x8000)
+
+/* Physically plausible PT100/PT1000 span. Readings outside this (e.g. the ~-242 C
+ * an open circuit yields) are treated as invalid and never fed to the filter. */
+#define TP_RTD_VALID_MIN_C       (-200.0f)
+#define TP_RTD_VALID_MAX_C       (850.0f)
+
 /* ----- Fault & capability reporting --------------------------------------- *
  * A standard Binary Input (Basic) cluster carries an interoperable "RTD fault"
  * flag (PresentValue=1 when faulted, with the FAULT StatusFlag bit set) so
