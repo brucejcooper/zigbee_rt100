@@ -4,5 +4,9 @@ build/
 temp_probe_zigbee/KiCAD-Libs
 temp_probe_zigbee/~*
 temp_probe_zigbee/_autosave*
+temp_probe_zigbee/*-backups/
+temp_probe_zigbee/*.kicad_prl
+temp_probe_zigbee/jlcpcb/
+temp_probe_zigbee/*.rpt
 managed_components/
 .DS_Store
