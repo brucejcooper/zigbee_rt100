@@ -1,4 +1,57 @@
-menu "Temperature Probe (MAX31865 + Zigbee)"
+menu "Temperature Probe (MAX31865 + WiFi/MQTT)"
+
+    menu "WiFi"
+        config TP_WIFI_SSID
+            string "WiFi SSID"
+            default "myssid"
+            help
+                SSID (network name) of the 2.4 GHz WiFi network to join.
+        config TP_WIFI_PASSWORD
+            string "WiFi password"
+            default "mypassword"
+            help
+                WPA/WPA2 passphrase. Leave empty for an open network.
+        config TP_WIFI_MAX_RETRY
+            int "Max immediate reconnect retries before backing off"
+            default 8
+    endmenu
+
+    menu "MQTT"
+        config TP_MQTT_URI
+            string "Broker URI"
+            default "mqtt://192.168.10.200:1883"
+            help
+                Full broker URI, e.g. mqtt://host:1883 or mqtts://host:8883.
+        config TP_MQTT_USER
+            string "Username"
+            default "tasmota"
+        config TP_MQTT_PASSWORD
+            string "Password"
+            default ""
+        config TP_MQTT_TOPIC_PREFIX
+            string "MQTT topic prefix for state/command topics"
+            default "mechination"
+            help
+                Leading namespace for this device's state/command topics
+                (<prefix>/<device_id>/...). Only the Home Assistant discovery
+                config messages use TP_HA_DISCOVERY_PREFIX ("homeassistant").
+        config TP_DEVICE_ID
+            string "Device ID (blank = auto-derive from MAC)"
+            default ""
+            help
+                Stable unique identifier placed in the topic path
+                (<prefix>/<device_id>/...) and used for the Home Assistant
+                unique_id, discovery object path and device identifier. Leave
+                blank to auto-derive as tempprobe_<mac3> (unique per board). Set
+                an explicit slug (e.g. mash_tun, boil_kettle) to run several
+                probes side by side without collisions.
+        config TP_HA_DISCOVERY_PREFIX
+            string "Home Assistant discovery prefix"
+            default "homeassistant"
+        config TP_DEVICE_NAME
+            string "Device name (shown in Home Assistant)"
+            default "Brewery Temp Probe"
+    endmenu
 
     menu "SPI / wiring (XIAO ESP32-C6)"
         config TP_SPI_SCLK_GPIO
@@ -31,11 +84,12 @@ menu "Temperature Probe (MAX31865 + Zigbee)"
     menu "External antenna (XIAO ESP32-C6 RF switch)"
         config TP_USE_EXTERNAL_ANTENNA
             bool "Use the external (U.FL) antenna"
-            default n
+            default y
             help
                 The XIAO ESP32-C6 has an on-board RF switch. GPIO3 must be driven
                 LOW to power the switch, then GPIO14 selects the antenna
-                (LOW = on-board ceramic, HIGH = external U.FL).
+                (LOW = on-board ceramic, HIGH = external U.FL). This is the
+                power-on default; it is also writable over MQTT and persisted.
         config TP_ANT_RF_SWITCH_EN_GPIO
             int "RF switch power-enable GPIO (active LOW)"
             default 3
@@ -49,9 +103,8 @@ menu "Temperature Probe (MAX31865 + Zigbee)"
             int "Factory-reset button GPIO (active LOW)"
             default 9
             help
-                GPIO read as an active-LOW pushbutton. Holding it for
-                TP_FACTORY_RESET_HOLD_MS erases the Zigbee NVRAM and reboots the
-                device factory-new so it re-commissions onto a fresh network.
+                Active-LOW pushbutton. Holding it for TP_FACTORY_RESET_HOLD_MS
+                erases the persisted runtime config (antenna, alpha) and reboots.
                 Default 9 is the XIAO ESP32-C6 on-board BOOT button.
         config TP_FACTORY_RESET_HOLD_MS
             int "Hold time to trigger factory reset (ms)"
@@ -100,14 +153,14 @@ menu "Temperature Probe (MAX31865 + Zigbee)"
 
     menu "Sampling & reporting"
         config TP_SAMPLE_PERIOD_MS
-            int "MeasuredValue publish period (ms)"
-            default 250
+            int "MQTT publish period (ms)"
+            default 1000
             range 50 60000
             help
-                How often the firmware pushes the current (EMA-smoothed) reading
-                into the Zigbee MeasuredValue attribute. The exponential filter
-                itself runs on every MAX31865 conversion (DRDY-driven, ~50/s);
-                this is only the publish/refresh cadence, not an averaging window.
+                How often the firmware publishes the current (EMA-smoothed)
+                reading to MQTT. The exponential filter runs on every MAX31865
+                conversion (DRDY-driven, ~50/s); this is only the publish cadence.
+                Keep <= 1000 to report at least once per second.
 
         config TP_EMA_ALPHA_PERMILLE
             int "EMA smoothing alpha (x1000)"
@@ -117,55 +170,8 @@ menu "Temperature Probe (MAX31865 + Zigbee)"
                 Exponential moving-average weight applied to each conversion:
                 y += alpha*(x - y). Stored as alpha x 1000, so 400 = 0.40.
                 Lower = smoother but laggier; 1000 = no smoothing (raw). This is
-                the power-on default; it is writable over Zigbee (diagnostics
-                cluster) and the runtime value is persisted to NVS.
-
-        config TP_REPORT_MIN_INTERVAL_S
-            int "Default report MIN interval (s)"
-            default 1
-            range 0 65534
-            help
-                Default minimum seconds between change-driven reports. This is the
-                fastest the *standard* Zigbee reporting mechanism can go (1 s
-                floor, whole seconds only). A coordinator can override it at
-                runtime with a Configure Reporting command.
-
-        config TP_REPORT_MAX_INTERVAL_S
-            int "Default report MAX interval (s)"
-            default 10
-            range 0 65534
-            help
-                Report at least this often even if the value hasn't changed
-                (heartbeat). 0 disables periodic reporting (report on change only).
-
-        config TP_REPORT_DELTA_CENTIDEG
-            int "Reportable change (1/100 C)"
-            default 5
-            help
-                Minimum change in MeasuredValue (units of 0.01 C) that triggers a
-                report. 5 = 0.05 C.
-
-        config TP_ANTENNA_AB_TEST
-            bool "Run antenna A/B RSSI self-test at boot (diagnostic)"
-            default n
-            help
-                When enabled, after joining the network the device cycles between
-                the external and on-board antennas a few times, stimulating
-                traffic and logging the average received RSSI/LQI for each. Use
-                to quantify the antenna difference, then disable for production.
-
-        config TP_FAST_REPORT_PERIOD_MS
-            int "Fast push-report period (ms, 0 = off)"
-            default 0
-            range 0 60000
-            help
-                Optional. Standard Zigbee reporting is capped at one report per
-                second. Set this > 0 to additionally push an unsolicited
-                Report Attributes command at this period (e.g. 200 ms = 5 Hz),
-                bypassing the 1 s floor. Reports go to whatever is bound to the
-                Temperature Measurement cluster (typically the coordinator).
-                Leave at 0 to rely solely on standard, client-configurable
-                reporting.
+                the power-on default; it is writable over MQTT (a Home Assistant
+                number entity) and the runtime value is persisted to NVS.
     endmenu
 
 endmenu

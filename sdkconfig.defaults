@@ -13,18 +13,6 @@ CONFIG_PARTITION_TABLE_OFFSET=0x8000
 CONFIG_PARTITION_TABLE_MD5=y
 
 #
-# Zigbee: build the Zigbee Coordinator/Router (ZCZR) library so this node can
-# act as a mains-powered Router. The runtime role is selected to ROUTER in code.
-#
-CONFIG_ZB_ENABLED=y
-CONFIG_ZB_ZCZR=y
-
-#
-# 802.15.4 radio
-#
-CONFIG_IEEE802154_ENABLED=y
-
-#
 # Console: use the native USB Serial/JTAG as the only console. UART0 (GPIO16/17)
 # carried a duplicate log stream and is not used, so disable it to free those pins.
 #

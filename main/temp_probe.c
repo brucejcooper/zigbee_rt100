@@ -1,44 +1,45 @@
 /*
- * Zigbee Router temperature probe for the Seeed XIAO ESP32-C6 with an
- * Adafruit MAX31865 RTD amplifier on the standard SPI pins.
+ * WiFi/MQTT temperature probe for the Seeed XIAO ESP32-C6 with an Adafruit
+ * MAX31865 RTD amplifier on the standard SPI pins.
  *
- * - Joins a Zigbee network as a mains-powered Router (ZR).
- * - Exposes a Home Automation Temperature Sensor endpoint (cluster 0x0402).
- * - Samples the RTD locally and publishes MeasuredValue. The reporting rate is
- *   client-configurable via the standard ZCL Configure Reporting command
- *   (1 s granularity / 1 s floor). An optional fast push-report mode can exceed
- *   1 Hz by sending unsolicited Report Attributes commands.
- * - Reports MAX31865 fault conditions two ways: a standard Binary Input cluster
- *   (interoperable "RTD fault" flag) and a manufacturer-specific diagnostics
- *   cluster carrying the raw fault byte plus the static sensor configuration.
+ * - Joins a 2.4 GHz WiFi network (station) and connects to an MQTT broker.
+ * - Samples the RTD with the MAX31865 in continuous mode; DRDY drives an
+ *   exponential moving average over every conversion (~50/s). The smoothed
+ *   value is published to MQTT at TP_SAMPLE_PERIOD_MS (>= 1 Hz).
+ * - Publishes Home Assistant MQTT-discovery configs for every entity so they
+ *   appear automatically: temperature, RTD-fault flag, the raw fault byte and
+ *   the static sensor configuration (diagnostic), plus two writable config
+ *   entities -- the EMA smoothing alpha (number) and the antenna select (switch).
+ * - On an RTD fault (or no trustworthy sample) the temperature entity is marked
+ *   unavailable via its own availability topic rather than reporting a bogus
+ *   number. A broker-side Last Will marks the whole device offline if it drops.
  */
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_mac.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
-#include "math.h"
-#if CONFIG_TP_ANTENNA_AB_TEST
-#include "esp_ieee802154.h"
-#endif
-
-#include "ha/esp_zigbee_ha_standard.h"
-#include "zcl_utility.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "mqtt_client.h"
 
 #include "temp_probe.h"
 #include "max31865.h"
 
-#if !defined ZB_COORDINATOR_ROLE
-#error "Build the ZCZR library: set CONFIG_ZB_ZCZR=y (Components -> Zigbee). Router role is selected at runtime."
-#endif
-
 static const char *TAG = "TEMP_PROBE";
 
 static max31865_handle_t s_rtd;
-static bool s_joined = false;
 
 /* ----- MAX31865 wiring selected from Kconfig ------------------------------ */
 #if defined(CONFIG_TP_RTD_3WIRE)
@@ -52,67 +53,48 @@ static bool s_joined = false;
 #define TP_WIRE_COUNT 2
 #endif
 
-/* Backing store for the manufacturer diagnostics-cluster attributes. The stack
- * copies these at registration; the fault byte is updated live at runtime. */
-static uint8_t  s_diag_fault_raw = 0;
-static uint8_t  s_diag_wires     = TP_WIRE_COUNT;
-static uint16_t s_diag_nominal   = CONFIG_TP_RTD_NOMINAL_OHMS;
-static uint16_t s_diag_ref       = CONFIG_TP_RTD_REF_OHMS;
-static bool     s_diag_filter50  = CONFIG_TP_RTD_FILTER_50HZ;
+/* ----- Persisted runtime config ------------------------------------------ */
+#define TP_NVS_NAMESPACE "tempprobe"
+#define TP_NVS_KEY_ANT   "ant_ext"
+#define TP_NVS_KEY_EMA   "ema_a"
 
-/* EMA smoothing weight, exposed over Zigbee as alpha x 1000 (the backing store
- * for the R/W diag attribute) and cached as a float for the sampling loop. A
- * Zigbee write overrides the Kconfig power-on default and is persisted to NVS. */
-static uint16_t s_diag_ema_permille = CONFIG_TP_EMA_ALPHA_PERMILLE;
-static float    s_ema_alpha         = CONFIG_TP_EMA_ALPHA_PERMILLE / 1000.0f;
-
-/* Antenna selection (true = external U.FL, false = on-board ceramic). The Kconfig
- * value is the power-on default; a Zigbee write to TP_DIAG_ATTR_ANTENNA overrides
- * it at runtime and is persisted to NVS so it survives reboots. */
 #if CONFIG_TP_USE_EXTERNAL_ANTENNA
 #define TP_ANTENNA_DEFAULT true
 #else
 #define TP_ANTENNA_DEFAULT false
 #endif
-#define TP_NVS_NAMESPACE "tempprobe"
-#define TP_NVS_KEY_ANT   "ant_ext"
-#define TP_NVS_KEY_EMA   "ema_a"
-static bool s_diag_antenna_ext = TP_ANTENNA_DEFAULT; /* backing store for the attr */
+
+static bool     s_antenna_ext   = TP_ANTENNA_DEFAULT;
+static uint16_t s_ema_permille  = CONFIG_TP_EMA_ALPHA_PERMILLE; /* alpha x 1000 */
+static float    s_ema_alpha     = CONFIG_TP_EMA_ALPHA_PERMILLE / 1000.0f;
+
+/* ----- MQTT client + connection state ------------------------------------ */
+static esp_mqtt_client_handle_t s_mqtt;
+static volatile bool s_mqtt_connected = false;
+/* Set on every (re)connect so the sensor task republishes its live state once,
+ * since retained edges may have been missed while disconnected. */
+static volatile bool s_republish = false;
+
+static TaskHandle_t s_sensor_task;
+
+/* ----- Topic strings (built once: <prefix>/<device_id>/...) --------------- */
+static char s_node_id[32];       /* device id (Kconfig or MAC-derived)   */
+static char t_status[96];        /* device availability (LWT)            */
+static char t_temp[96];          /* temperature value                    */
+static char t_temp_status[96];   /* temperature availability             */
+static char t_fault[96];         /* RTD fault flag ON/OFF                 */
+static char t_fault_raw[96];     /* raw fault byte                       */
+static char t_wires[96];
+static char t_nominal[96];
+static char t_ref[96];
+static char t_filter[96];
+static char t_alpha[96];
+static char t_alpha_set[96];
+static char t_ant[96];
+static char t_ant_set[96];
 
 /* ------------------------------------------------------------------------- */
-/* Antenna control. The XIAO ESP32-C6 routes RF through an on-board switch:     */
-/* GPIO3 (active LOW) powers the switch, GPIO14 selects the antenna (LOW =      */
-/* on-board ceramic, HIGH = external U.FL). The selection is settable over      */
-/* Zigbee (TP_DIAG_ATTR_ANTENNA) and persisted in NVS.                          */
-/* ------------------------------------------------------------------------- */
-static bool antenna_load_pref(void)
-{
-    bool external = TP_ANTENNA_DEFAULT;
-    nvs_handle_t h;
-    if (nvs_open(TP_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        uint8_t stored = 0;
-        if (nvs_get_u8(h, TP_NVS_KEY_ANT, &stored) == ESP_OK) {
-            external = (stored != 0);
-        }
-        nvs_close(h);
-    }
-    return external;
-}
-
-static void antenna_save_pref(bool external)
-{
-    nvs_handle_t h;
-    if (nvs_open(TP_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, TP_NVS_KEY_ANT, external ? 1 : 0);
-        nvs_commit(h);
-        nvs_close(h);
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-/* EMA smoothing weight: load the persisted alpha (alpha x 1000) at boot,      */
-/* persist runtime changes, and keep the float cache in sync. Clamped to       */
-/* [1, 1000] so the filter can never freeze (alpha=0) and 1000 means raw.      */
+/* NVS-persisted settings                                                      */
 /* ------------------------------------------------------------------------- */
 static uint16_t ema_clamp(uint16_t permille)
 {
@@ -121,45 +103,55 @@ static uint16_t ema_clamp(uint16_t permille)
     return permille;
 }
 
-static void ema_alpha_load(void)
+static void prefs_load(void)
 {
-    uint16_t permille = CONFIG_TP_EMA_ALPHA_PERMILLE;
     nvs_handle_t h;
     if (nvs_open(TP_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        uint16_t stored = 0;
-        if (nvs_get_u16(h, TP_NVS_KEY_EMA, &stored) == ESP_OK) {
-            permille = stored;
+        uint8_t ant = 0;
+        if (nvs_get_u8(h, TP_NVS_KEY_ANT, &ant) == ESP_OK) {
+            s_antenna_ext = (ant != 0);
+        }
+        uint16_t ema = 0;
+        if (nvs_get_u16(h, TP_NVS_KEY_EMA, &ema) == ESP_OK) {
+            s_ema_permille = ema;
         }
         nvs_close(h);
     }
-    s_diag_ema_permille = ema_clamp(permille);
-    s_ema_alpha = s_diag_ema_permille / 1000.0f;
+    s_ema_permille = ema_clamp(s_ema_permille);
+    s_ema_alpha = s_ema_permille / 1000.0f;
 }
 
-static void ema_alpha_set(uint16_t permille)
+static void prefs_save_u8(const char *key, uint8_t v)
 {
-    s_diag_ema_permille = ema_clamp(permille);
-    s_ema_alpha = s_diag_ema_permille / 1000.0f;
     nvs_handle_t h;
     if (nvs_open(TP_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u16(h, TP_NVS_KEY_EMA, s_diag_ema_permille);
+        nvs_set_u8(h, key, v);
         nvs_commit(h);
         nvs_close(h);
     }
-    ESP_LOGW(TAG, "EMA alpha set to %.3f (%u/1000) via Zigbee (persisted)",
-             s_ema_alpha, s_diag_ema_permille);
 }
 
-/* Drive GPIO14 to the requested antenna. GPIO3 is held low (switch powered). */
+static void prefs_save_u16(const char *key, uint16_t v)
+{
+    nvs_handle_t h;
+    if (nvs_open(TP_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u16(h, key, v);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Antenna control: GPIO3 (active LOW) powers the RF switch, GPIO14 selects     */
+/* the antenna (LOW = on-board ceramic, HIGH = external U.FL).                  */
+/* ------------------------------------------------------------------------- */
 static void antenna_apply(bool external)
 {
     gpio_set_level(CONFIG_TP_ANT_RF_SWITCH_EN_GPIO, 0);
     gpio_set_level(CONFIG_TP_ANT_SELECT_GPIO, external ? 1 : 0);
-    s_diag_antenna_ext = external;
+    s_antenna_ext = external;
 }
 
-/* Boot-time setup: configure the GPIOs and apply the persisted selection.
- * Must run before the radio transmits. */
 static void configure_antenna(void)
 {
     gpio_config_t io = {
@@ -171,157 +163,289 @@ static void configure_antenna(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&io));
-    bool external = antenna_load_pref();
-    antenna_apply(external);
-    ESP_LOGI(TAG, "Antenna: %s (RF-switch GPIO%d=0, select GPIO%d=%d)",
-             external ? "external U.FL" : "on-board ceramic",
-             CONFIG_TP_ANT_RF_SWITCH_EN_GPIO, CONFIG_TP_ANT_SELECT_GPIO, external ? 1 : 0);
+    antenna_apply(s_antenna_ext);
+    ESP_LOGI(TAG, "Antenna: %s", s_antenna_ext ? "external U.FL" : "on-board ceramic");
 }
-
-/* Runtime change requested over Zigbee: apply, persist, log. */
-static void antenna_set(bool external)
-{
-    antenna_apply(external);
-    antenna_save_pref(external);
-    ESP_LOGW(TAG, "Antenna switched to %s via Zigbee (persisted)",
-             external ? "external U.FL" : "on-board ceramic");
-}
-
-#if CONFIG_TP_ANTENNA_AB_TEST
-/* Antenna A/B RSSI self-test. Cycles between antennas, stimulating downlink
- * traffic (each report draws an APS ack back from the coordinator) and sampling
- * the RSSI/LQI of frames this device receives from its parent. recent_rssi
- * reflects how strongly WE hear the parent, which is what our antenna changes. */
-static void ab_send_report(void)
-{
-    esp_zb_zcl_report_attr_cmd_t r = {
-        .zcl_basic_cmd.src_endpoint = HA_TEMP_SENSOR_ENDPOINT,
-        .address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT,
-        .clusterID = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
-        .attributeID = ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-    };
-    esp_zb_lock_acquire(portMAX_DELAY);
-    esp_zb_zcl_report_attr_cmd_req(&r);
-    esp_zb_lock_release();
-}
-
-static void antenna_ab_test_task(void *arg)
-{
-    const int rounds = 3;
-    const int window_ms = 12000;
-    const int step_ms = 400;
-    vTaskDelay(pdMS_TO_TICKS(8000)); /* let the network settle after boot */
-    ESP_LOGW(TAG, "=== Antenna A/B RSSI test starting (%d rounds) ===", rounds);
-
-    for (int round = 1; round <= rounds; round++) {
-        for (int ext = 1; ext >= 0; ext--) {
-            antenna_apply(ext != 0);
-            vTaskDelay(pdMS_TO_TICKS(1500)); /* RF settle */
-            long rssi_sum = 0, lqi_sum = 0;
-            int n = 0, rmin = 127, rmax = -128;
-            for (int t = 0; t < window_ms; t += step_ms) {
-                ab_send_report();
-                vTaskDelay(pdMS_TO_TICKS(step_ms));
-                int8_t rssi = esp_ieee802154_get_recent_rssi();
-                uint8_t lqi = esp_ieee802154_get_recent_lqi();
-                if (rssi <= 0 && rssi >= -120) { /* plausible dBm */
-                    rssi_sum += rssi; lqi_sum += lqi; n++;
-                    if (rssi < rmin) rmin = rssi;
-                    if (rssi > rmax) rmax = rssi;
-                }
-            }
-            if (n > 0) {
-                ESP_LOGW(TAG, "AB r%d %-8s: RSSI avg=%.1f dBm (min=%d max=%d)  LQI avg=%ld  samples=%d",
-                         round, ext ? "EXTERNAL" : "INTERNAL",
-                         (double)rssi_sum / n, rmin, rmax, lqi_sum / n, n);
-            } else {
-                ESP_LOGW(TAG, "AB r%d %-8s: NO frames received (link likely lost on this antenna)",
-                         round, ext ? "EXTERNAL" : "INTERNAL");
-            }
-        }
-    }
-    antenna_apply(antenna_load_pref()); /* restore persisted selection */
-    ESP_LOGW(TAG, "=== Antenna A/B RSSI test complete; antenna restored ===");
-    vTaskDelete(NULL);
-}
-#endif /* CONFIG_TP_ANTENNA_AB_TEST */
 
 /* ------------------------------------------------------------------------- */
-/* Fault reporting: update the standard Binary Input flag and the diagnostics  */
-/* cluster's raw fault byte, then push an edge-triggered report. Caller holds   */
-/* the Zigbee lock.                                                            */
+/* MQTT publish helper                                                         */
 /* ------------------------------------------------------------------------- */
-static void publish_fault_state(uint8_t fault_raw)
+static void pub(const char *topic, const char *payload, bool retain)
 {
-    static bool s_have_last = false;
-    static uint8_t s_last_raw = 0;
-    if (s_have_last && fault_raw == s_last_raw) {
-        return; /* edge-triggered: nothing changed */
+    if (!s_mqtt_connected) {
+        return;
     }
-    s_have_last = true;
-    s_last_raw = fault_raw;
+    esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, retain ? 1 : 0);
+}
 
-    bool fault_active = (fault_raw != 0);
-    uint8_t status_flag = fault_active ? TP_BI_STATUS_FLAG_FAULT : 0;
+/* ------------------------------------------------------------------------- */
+/* Home Assistant MQTT discovery                                               */
+/* ------------------------------------------------------------------------- */
+/* UTF-8 unit strings, kept as separate literals so the \xNN hex escapes are
+ * bounded (the C tokenizer would otherwise swallow following chars as hex). */
+#define DEG_C "\xC2\xB0" "C"   /* °C */
+#define OHM   "\xCE\xA9"       /* Ω  */
 
-    esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID, &fault_active, false);
-    esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ESP_ZB_ZCL_ATTR_BINARY_INPUT_STATUS_FLAGS_ID, &status_flag, false);
-    esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT, TP_DIAG_CLUSTER_ID,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 TP_DIAG_ATTR_FAULT_RAW, &fault_raw, false);
+static char s_device_json[320];
 
-    if (fault_active) {
-        ESP_LOGW(TAG, "MAX31865 fault: 0x%02x%s%s%s%s%s%s", fault_raw,
-                 (fault_raw & MAX31865_FAULT_HIGHTHRESH) ? " RTD>high" : "",
-                 (fault_raw & MAX31865_FAULT_LOWTHRESH)  ? " RTD<low" : "",
-                 (fault_raw & MAX31865_FAULT_REFINLOW)   ? " REFIN-<0.85*Vbias" : "",
-                 (fault_raw & MAX31865_FAULT_REFINHIGH)  ? " REFIN->0.85*Vbias" : "",
-                 (fault_raw & MAX31865_FAULT_RTDINLOW)   ? " RTDIN-<0.85*Vbias" : "",
-                 (fault_raw & MAX31865_FAULT_OVUV)       ? " over/under-volt" : "");
+static void build_device_json(void)
+{
+    snprintf(s_device_json, sizeof(s_device_json),
+             "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\","
+             "\"manufacturer\":\"%s\",\"model\":\"%s\",\"sw_version\":\"%s\"}",
+             s_node_id, CONFIG_TP_DEVICE_NAME, TP_MANUFACTURER, TP_MODEL, TP_SW_VERSION);
+}
+
+/* Wrap an entity's JSON members with availability + device + unique_id and
+ * publish the retained discovery config. `fields` is the comma-separated
+ * entity-specific members (no surrounding braces). */
+static void disco(const char *component, const char *object, const char *fields, bool temp_avail)
+{
+    char avail[320];
+    if (temp_avail) {
+        snprintf(avail, sizeof(avail),
+                 "\"availability\":[{\"topic\":\"%s\"},{\"topic\":\"%s\"}],"
+                 "\"availability_mode\":\"all\"", t_status, t_temp_status);
     } else {
-        ESP_LOGI(TAG, "MAX31865 fault cleared");
+        snprintf(avail, sizeof(avail), "\"availability\":[{\"topic\":\"%s\"}]", t_status);
     }
 
-    if (!s_joined) {
-        return; /* nothing to send to yet */
-    }
-    /* Edge-triggered unsolicited reports so a fault is delivered immediately,
-     * independent of the configured reporting intervals. Goes to bound nodes. */
-    esp_zb_zcl_report_attr_cmd_t bi_report = {
-        .zcl_basic_cmd.src_endpoint = HA_TEMP_SENSOR_ENDPOINT,
-        .address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT,
-        .clusterID = ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
-        .attributeID = ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
-    };
-    esp_zb_zcl_report_attr_cmd_req(&bi_report);
+    char payload[1500];
+    snprintf(payload, sizeof(payload), "{%s,%s,%s,\"unique_id\":\"%s_%s\"}",
+             fields, avail, s_device_json, s_node_id, object);
 
-    esp_zb_zcl_report_attr_cmd_t diag_report = {
-        .zcl_basic_cmd.src_endpoint = HA_TEMP_SENSOR_ENDPOINT,
-        .address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT,
-        .clusterID = TP_DIAG_CLUSTER_ID,
-        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
-        .attributeID = TP_DIAG_ATTR_FAULT_RAW,
-    };
-    esp_zb_zcl_report_attr_cmd_req(&diag_report);
+    char topic[224];
+    snprintf(topic, sizeof(topic), "%s/%s/%s/%s/config",
+             CONFIG_TP_HA_DISCOVERY_PREFIX, component, s_node_id, object);
+    pub(topic, payload, true);
+}
+
+static void publish_discovery(void)
+{
+    char f[512];
+
+    /* Temperature (unavailable on fault via its own status topic). */
+    snprintf(f, sizeof(f),
+             "\"name\":\"Temperature\",\"device_class\":\"temperature\","
+             "\"state_class\":\"measurement\",\"unit_of_measurement\":\"" DEG_C "\","
+             "\"suggested_display_precision\":2,\"state_topic\":\"%s\"", t_temp);
+    disco("sensor", "temperature", f, true);
+
+    /* RTD fault flag. */
+    snprintf(f, sizeof(f),
+             "\"name\":\"RTD fault\",\"device_class\":\"problem\","
+             "\"payload_on\":\"ON\",\"payload_off\":\"OFF\","
+             "\"entity_category\":\"diagnostic\",\"state_topic\":\"%s\"", t_fault);
+    disco("binary_sensor", "rtd_fault", f, false);
+
+    /* Raw fault byte. */
+    snprintf(f, sizeof(f),
+             "\"name\":\"RTD fault byte\",\"icon\":\"mdi:alert-circle-outline\","
+             "\"entity_category\":\"diagnostic\",\"state_topic\":\"%s\"", t_fault_raw);
+    disco("sensor", "rtd_fault_raw", f, false);
+
+    /* Static sensor configuration (diagnostic). */
+    snprintf(f, sizeof(f),
+             "\"name\":\"RTD wires\",\"entity_category\":\"diagnostic\","
+             "\"state_topic\":\"%s\"", t_wires);
+    disco("sensor", "rtd_wires", f, false);
+
+    snprintf(f, sizeof(f),
+             "\"name\":\"RTD nominal\",\"unit_of_measurement\":\"" OHM "\","
+             "\"entity_category\":\"diagnostic\",\"state_topic\":\"%s\"", t_nominal);
+    disco("sensor", "rtd_nominal", f, false);
+
+    snprintf(f, sizeof(f),
+             "\"name\":\"RTD reference\",\"unit_of_measurement\":\"" OHM "\","
+             "\"entity_category\":\"diagnostic\",\"state_topic\":\"%s\"", t_ref);
+    disco("sensor", "rtd_reference", f, false);
+
+    snprintf(f, sizeof(f),
+             "\"name\":\"Mains filter\",\"unit_of_measurement\":\"Hz\","
+             "\"entity_category\":\"diagnostic\",\"state_topic\":\"%s\"", t_filter);
+    disco("sensor", "mains_filter", f, false);
+
+    /* Writable: antenna select (switch). */
+    snprintf(f, sizeof(f),
+             "\"name\":\"External antenna\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\","
+             "\"icon\":\"mdi:antenna\",\"entity_category\":\"config\","
+             "\"state_topic\":\"%s\",\"command_topic\":\"%s\"", t_ant, t_ant_set);
+    disco("switch", "antenna", f, false);
+
+    /* Writable: EMA smoothing alpha (number). */
+    snprintf(f, sizeof(f),
+             "\"name\":\"Smoothing alpha\",\"min\":0.01,\"max\":1,\"step\":0.01,"
+             "\"mode\":\"box\",\"icon\":\"mdi:chart-bell-curve\","
+             "\"entity_category\":\"config\","
+             "\"state_topic\":\"%s\",\"command_topic\":\"%s\"", t_alpha, t_alpha_set);
+    disco("number", "alpha", f, false);
 }
 
 /* ------------------------------------------------------------------------- */
-/* Sensor sampling task: read the RTD + fault register, push MeasuredValue and  */
-/* fault state into the clusters. Updating the temperature attribute drives the */
-/* stack's standard reporting machinery; the optional fast path fires extra      */
-/* unsolicited reports for sub-second publishing.                              */
+/* State publishing                                                            */
 /* ------------------------------------------------------------------------- */
-static TaskHandle_t s_sensor_task;
+static void publish_config_state(void)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.2f", s_ema_alpha);
+    pub(t_alpha, buf, true);
+    pub(t_ant, s_antenna_ext ? "ON" : "OFF", true);
+}
 
+static void publish_static_diag(void)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", TP_WIRE_COUNT);
+    pub(t_wires, buf, true);
+    snprintf(buf, sizeof(buf), "%d", CONFIG_TP_RTD_NOMINAL_OHMS);
+    pub(t_nominal, buf, true);
+    snprintf(buf, sizeof(buf), "%d", CONFIG_TP_RTD_REF_OHMS);
+    pub(t_ref, buf, true);
+    pub(t_filter, CONFIG_TP_RTD_FILTER_50HZ ? "50" : "60", true);
+}
+
+/* ------------------------------------------------------------------------- */
+/* MQTT command handling                                                       */
+/* ------------------------------------------------------------------------- */
+static void handle_command(const char *topic, int tlen, const char *data, int dlen)
+{
+    char payload[32];
+    int n = dlen < (int)sizeof(payload) - 1 ? dlen : (int)sizeof(payload) - 1;
+    memcpy(payload, data, n);
+    payload[n] = '\0';
+
+    if (tlen == (int)strlen(t_alpha_set) && strncmp(topic, t_alpha_set, tlen) == 0) {
+        float a = strtof(payload, NULL);
+        uint16_t permille = ema_clamp((uint16_t)lroundf(a * 1000.0f));
+        s_ema_permille = permille;
+        s_ema_alpha = permille / 1000.0f;
+        prefs_save_u16(TP_NVS_KEY_EMA, permille);
+        ESP_LOGW(TAG, "alpha set to %.3f via MQTT (persisted)", s_ema_alpha);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.2f", s_ema_alpha);
+        pub(t_alpha, buf, true);
+    } else if (tlen == (int)strlen(t_ant_set) && strncmp(topic, t_ant_set, tlen) == 0) {
+        bool ext = (strncmp(payload, "ON", 2) == 0) || (payload[0] == '1');
+        antenna_apply(ext);
+        prefs_save_u8(TP_NVS_KEY_ANT, ext ? 1 : 0);
+        ESP_LOGW(TAG, "antenna set to %s via MQTT (persisted)",
+                 ext ? "external U.FL" : "on-board ceramic");
+        pub(t_ant, ext ? "ON" : "OFF", true);
+    }
+}
+
+static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT connected");
+        s_mqtt_connected = true;
+        esp_mqtt_client_subscribe(s_mqtt, t_alpha_set, 1);
+        esp_mqtt_client_subscribe(s_mqtt, t_ant_set, 1);
+        pub(t_status, "online", true);      /* clears the Last Will */
+        publish_discovery();
+        publish_static_diag();
+        publish_config_state();
+        s_republish = true;                 /* let the sensor task re-emit live state */
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "MQTT disconnected");
+        s_mqtt_connected = false;
+        break;
+    case MQTT_EVENT_DATA:
+        handle_command(event->topic, event->topic_len, event->data, event->data_len);
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGW(TAG, "MQTT error");
+        break;
+    default:
+        break;
+    }
+}
+
+static void mqtt_start(void)
+{
+    if (s_mqtt) {
+        return;
+    }
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = CONFIG_TP_MQTT_URI,
+        .credentials.username = CONFIG_TP_MQTT_USER,
+        .credentials.authentication.password = CONFIG_TP_MQTT_PASSWORD,
+        /* Last Will: the broker publishes "offline" (retained) to the device
+         * availability topic if this client drops without a clean disconnect
+         * (power loss, crash, WiFi loss), marking every HA entity unavailable.
+         * A short keepalive makes that detection prompt (~1.5x = ~22 s) instead
+         * of the 120 s default. On (re)connect we publish "online" ourselves. */
+        .session.keepalive = 15,
+        .session.last_will = {
+            .topic = t_status,
+            .msg = "offline",
+            .msg_len = 0,
+            .qos = 1,
+            .retain = 1,
+        },
+    };
+    s_mqtt = esp_mqtt_client_init(&cfg);
+    esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt);
+}
+
+/* ------------------------------------------------------------------------- */
+/* WiFi station                                                                */
+/* ------------------------------------------------------------------------- */
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *e = data;
+        s_mqtt_connected = false;
+        ESP_LOGW(TAG, "WiFi disconnected (reason=%d), reconnecting", e ? e->reason : -1);
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        mqtt_start();
+    }
+}
+
+static void wifi_start(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                        wifi_event_handler, NULL, NULL));
+
+    wifi_config_t wc = {0};
+    strncpy((char *)wc.sta.ssid, CONFIG_TP_WIFI_SSID, sizeof(wc.sta.ssid) - 1);
+    strncpy((char *)wc.sta.password, CONFIG_TP_WIFI_PASSWORD, sizeof(wc.sta.password) - 1);
+    wc.sta.threshold.authmode = strlen(CONFIG_TP_WIFI_PASSWORD) ? WIFI_AUTH_WPA2_PSK
+                                                                : WIFI_AUTH_OPEN;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    /* AU regulatory domain (channels 1-13). Antenna was already selected in
+     * configure_antenna() before WiFi init, so RF calibration ran on the right
+     * path -- selecting it afterwards would calibrate against a dead antenna. */
+    esp_wifi_set_country_code("AU", false);
+    ESP_LOGI(TAG, "WiFi started (ant=%s); joining \"%s\"",
+             s_antenna_ext ? "external U.FL" : "on-board ceramic", CONFIG_TP_WIFI_SSID);
+    esp_wifi_connect();
+}
+
+/* ------------------------------------------------------------------------- */
+/* Sensor sampling task: DRDY-driven EMA, publish to MQTT each period.          */
+/* ------------------------------------------------------------------------- */
 #if CONFIG_TP_DRDY_GPIO >= 0
-/* MAX31865 DRDY (active LOW) fires when each continuous conversion is ready.
- * Keep the ISR trivial: just wake the sampling task to do the SPI read. */
 static void IRAM_ATTR drdy_isr(void *arg)
 {
     BaseType_t hpw = pdFALSE;
@@ -333,15 +457,9 @@ static void IRAM_ATTR drdy_isr(void *arg)
 static void sensor_task(void *arg)
 {
     const int64_t window_us = (int64_t)CONFIG_TP_SAMPLE_PERIOD_MS * 1000;
-#if CONFIG_TP_FAST_REPORT_PERIOD_MS > 0
-    uint32_t ms_since_fast_report = 0;
-#endif
+    s_sensor_task = xTaskGetCurrentTaskHandle();
 
 #if CONFIG_TP_DRDY_GPIO >= 0
-    /* Interrupt-driven acquisition: run an exponential moving average over every
-     * conversion (~tens/s) so the MeasuredValue is continuously smoothed and
-     * always fresh; publish the current EMA on the slower cadence below. */
-    s_sensor_task = xTaskGetCurrentTaskHandle();
     gpio_config_t drdy = {
         .pin_bit_mask = 1ULL << CONFIG_TP_DRDY_GPIO,
         .mode = GPIO_MODE_INPUT,
@@ -359,21 +477,20 @@ static void sensor_task(void *arg)
 
     double ema = 0.0;
     bool ema_valid = false;
-    uint32_t accepted = 0;        /* in-range samples integrated this period */
+    uint32_t accepted = 0;
     int64_t last_emit = esp_timer_get_time();
 
+    bool prev_valid = false;
+    bool prev_fault_active = false;
+    uint8_t prev_fault_raw = 0xFF; /* force first publish */
+    bool first = true;
+
     for (;;) {
-        /* Block until the next conversion (DRDY). The timeout doubles as a
-         * stalled-DRDY fallback, so reporting can't wedge (it degrades to one
-         * read per publish period). */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CONFIG_TP_SAMPLE_PERIOD_MS));
 
         float temp_c = 0.0f;
         if (max31865_read_temperature(s_rtd, &temp_c) == ESP_OK &&
             temp_c >= TP_RTD_VALID_MIN_C && temp_c <= TP_RTD_VALID_MAX_C) {
-            /* y += alpha*(x - y). Seed on the first good sample to avoid a long
-             * ramp from zero. Faulted or out-of-range reads are dropped here so
-             * a single garbage transition sample can't poison the EMA. */
             if (!ema_valid) {
                 ema = temp_c;
                 ema_valid = true;
@@ -388,329 +505,58 @@ static void sensor_task(void *arg)
         }
         last_emit = esp_timer_get_time();
 
-        /* Publish boundary: read the detailed fault register and push the
-         * current smoothed MeasuredValue + fault state. */
         uint8_t fault_raw = 0;
         max31865_read_fault(s_rtd, &fault_raw);
+        bool fault_active = (fault_raw != 0);
+        bool valid = (!fault_active && accepted > 0);
 
-        esp_zb_lock_acquire(portMAX_DELAY);
-        if (fault_raw == 0 && accepted > 0) {
-            int16_t centi = (int16_t)lroundf((float)ema * 100.0f);
-            esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT,
-                                         ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-                                         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                         ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-                                         &centi, false);
-#if CONFIG_TP_FAST_REPORT_PERIOD_MS > 0
-            ms_since_fast_report += CONFIG_TP_SAMPLE_PERIOD_MS;
-            if (s_joined && ms_since_fast_report >= CONFIG_TP_FAST_REPORT_PERIOD_MS) {
-                ms_since_fast_report = 0;
-                esp_zb_zcl_report_attr_cmd_t report = {
-                    .zcl_basic_cmd.src_endpoint = HA_TEMP_SENSOR_ENDPOINT,
-                    .address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT,
-                    .clusterID = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-                    .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
-                    .attributeID = ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-                };
-                esp_zb_zcl_report_attr_cmd_req(&report);
+        if (s_republish) {
+            /* Re-emit edge-triggered state after a reconnect. */
+            first = true;
+            s_republish = false;
+        }
+
+        if (s_mqtt_connected) {
+            if (valid) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%.2f", ema);
+                pub(t_temp, buf, true);
+            } else {
+                ema_valid = false; /* re-seed cleanly on recovery */
             }
-#endif
-            ESP_LOGD(TAG, "RTD EMA=%.3f C alpha=%.3f (MeasuredValue=%d)",
-                     ema, s_ema_alpha, centi);
+            if (first || valid != prev_valid) {
+                pub(t_temp_status, valid ? "online" : "offline", true);
+                prev_valid = valid;
+            }
+            if (first || fault_active != prev_fault_active) {
+                pub(t_fault, fault_active ? "ON" : "OFF", true);
+                prev_fault_active = fault_active;
+            }
+            if (first || fault_raw != prev_fault_raw) {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%u", fault_raw);
+                pub(t_fault_raw, buf, true);
+                prev_fault_raw = fault_raw;
+            }
+            first = false;
+        }
+
+        if (valid) {
+            ESP_LOGD(TAG, "EMA=%.3f C alpha=%.3f", ema, s_ema_alpha);
         } else {
-            /* Faulted, or no trustworthy sample this period: publish the ZCL
-             * invalid sentinel (0x8000) so the value reads as unavailable rather
-             * than a bogus number, and force a clean re-seed on recovery. */
-            int16_t invalid = TP_MEASURED_INVALID;
-            esp_zb_zcl_set_attribute_val(HA_TEMP_SENSOR_ENDPOINT,
-                                         ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-                                         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                         ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-                                         &invalid, false);
-            ema_valid = false;
-            ESP_LOGW(TAG, "RTD unavailable (fault=0x%02x, in-range samples=%u); reporting invalid",
+            ESP_LOGW(TAG, "RTD unavailable (fault=0x%02x, in-range samples=%u)",
                      fault_raw, (unsigned)accepted);
         }
-        publish_fault_state(fault_raw);
-        esp_zb_lock_release();
 
-        /* Auto conversion mode re-asserts a persisting fault immediately. */
-        if (fault_raw != 0) {
+        if (fault_active) {
             max31865_clear_fault(s_rtd);
         }
         accepted = 0;
     }
 }
 
-static esp_err_t deferred_driver_init(void)
-{
-    static bool initialised = false;
-    if (initialised) {
-        return ESP_OK;
-    }
-    max31865_config_t cfg = {
-        .host = SPI2_HOST,
-        .sclk_gpio = CONFIG_TP_SPI_SCLK_GPIO,
-        .miso_gpio = CONFIG_TP_SPI_MISO_GPIO,
-        .mosi_gpio = CONFIG_TP_SPI_MOSI_GPIO,
-        .cs_gpio = CONFIG_TP_SPI_CS_GPIO,
-        .clock_hz = CONFIG_TP_SPI_CLOCK_HZ,
-        .wires = TP_WIRES,
-        .filter_50hz = CONFIG_TP_RTD_FILTER_50HZ,
-        .rtd_nominal_ohms = (float)CONFIG_TP_RTD_NOMINAL_OHMS,
-        .ref_ohms = (float)CONFIG_TP_RTD_REF_OHMS,
-    };
-    ESP_RETURN_ON_ERROR(max31865_init(&cfg, &s_rtd), TAG, "MAX31865 init failed");
-
-    BaseType_t ok = xTaskCreate(sensor_task, "rtd_sample", 4096, NULL, 4, NULL);
-    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_FAIL, TAG, "Failed to start sensor task");
-
-#if CONFIG_TP_ANTENNA_AB_TEST
-    xTaskCreate(antenna_ab_test_task, "ant_ab", 4096, NULL, 3, NULL);
-#endif
-
-    initialised = true;
-    return ESP_OK;
-}
-
 /* ------------------------------------------------------------------------- */
-/* Reporting configuration: advertise sensible defaults so a coordinator that  */
-/* does not send its own Configure Reporting still gets periodic updates.      */
-/* A client can override min/max interval and reportable change at runtime.    */
-/* ------------------------------------------------------------------------- */
-static void configure_reporting(void)
-{
-    esp_zb_zcl_reporting_info_t temp_info = {
-        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
-        .ep = HA_TEMP_SENSOR_ENDPOINT,
-        .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-        .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        .attr_id = ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-        .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
-        .dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .u.send_info = {
-            .min_interval = CONFIG_TP_REPORT_MIN_INTERVAL_S,
-            .max_interval = CONFIG_TP_REPORT_MAX_INTERVAL_S,
-            .def_min_interval = CONFIG_TP_REPORT_MIN_INTERVAL_S,
-            .def_max_interval = CONFIG_TP_REPORT_MAX_INTERVAL_S,
-            .delta.u16 = CONFIG_TP_REPORT_DELTA_CENTIDEG,
-        },
-    };
-    esp_zb_zcl_update_reporting_info(&temp_info);
-
-    /* Periodic heartbeat + change reporting for the Binary Input fault flag. */
-    esp_zb_zcl_reporting_info_t fault_info = {
-        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
-        .ep = HA_TEMP_SENSOR_ENDPOINT,
-        .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-        .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        .attr_id = ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
-        .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
-        .dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .u.send_info = {
-            .min_interval = 1,
-            .max_interval = 300,
-            .def_min_interval = 1,
-            .def_max_interval = 300,
-        },
-    };
-    esp_zb_zcl_update_reporting_info(&fault_info);
-}
-
-/* ------------------------------------------------------------------------- */
-/* Endpoint assembly: base HA Temperature Sensor clusters + a Binary Input     */
-/* fault flag + a manufacturer diagnostics cluster.                            */
-/* ------------------------------------------------------------------------- */
-static esp_zb_ep_list_t *build_endpoint(void)
-{
-    esp_zb_temperature_sensor_cfg_t sensor_cfg = ESP_ZB_DEFAULT_TEMPERATURE_SENSOR_CONFIG();
-    sensor_cfg.temp_meas_cfg.min_value = TP_MEASURED_MIN_CENTIDEG;
-    sensor_cfg.temp_meas_cfg.max_value = TP_MEASURED_MAX_CENTIDEG;
-    /* Mains-powered Router: advertise it on the Basic cluster PowerSource attr
-     * (otherwise it defaults to "unknown" and tools show no power source). */
-    sensor_cfg.basic_cfg.power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_MAINS_SINGLE_PHASE;
-
-    esp_zb_cluster_list_t *clusters = esp_zb_temperature_sensor_clusters_create(&sensor_cfg);
-
-    /* Extra Basic-cluster identity attributes — these populate the device page
-     * in Zigbee2MQTT / ZHA (hardware/app/stack version, build date, build id)
-     * and make the auto-generated definition far more informative. */
-    {
-        esp_zb_attribute_list_t *basic =
-            esp_zb_cluster_list_get_cluster(clusters, ESP_ZB_ZCL_CLUSTER_ID_BASIC,
-                                            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-        uint8_t hw_version  = TP_HW_VERSION;
-        uint8_t app_version = TP_APP_VERSION;
-        uint8_t stack_version = TP_STACK_VERSION;
-        esp_zb_basic_cluster_add_attr(basic, ESP_ZB_ZCL_ATTR_BASIC_HW_VERSION_ID, &hw_version);
-        esp_zb_basic_cluster_add_attr(basic, ESP_ZB_ZCL_ATTR_BASIC_APPLICATION_VERSION_ID, &app_version);
-        esp_zb_basic_cluster_add_attr(basic, ESP_ZB_ZCL_ATTR_BASIC_STACK_VERSION_ID, &stack_version);
-        /* ZCL strings are length-prefixed; the macros include the prefix byte. */
-        char date_code[]   = ESP_TP_DATE_CODE;
-        char sw_build_id[] = ESP_TP_SW_BUILD_ID;
-        esp_zb_basic_cluster_add_attr(basic, ESP_ZB_ZCL_ATTR_BASIC_DATE_CODE_ID, date_code);
-        esp_zb_basic_cluster_add_attr(basic, ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID, sw_build_id);
-    }
-
-    /* Binary Input (Basic): standard, interoperable RTD-fault indicator.
-     * create() already declares OutOfService, PresentValue and StatusFlags. */
-    esp_zb_binary_input_cluster_cfg_t bi_cfg = {
-        .out_of_service = false,
-        .status_flags = 0,
-    };
-    esp_zb_attribute_list_t *bi = esp_zb_binary_input_cluster_create(&bi_cfg);
-    char bi_desc[] = "\x09" "RTD fault"; /* ZCL char string: length-prefixed */
-    esp_zb_cluster_add_attr(bi, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-                            ESP_ZB_ZCL_ATTR_BINARY_INPUT_DESCRIPTION_ID,
-                            ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING,
-                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, bi_desc);
-    ESP_ERROR_CHECK(esp_zb_cluster_list_add_binary_input_cluster(clusters, bi, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
-
-    /* Manufacturer diagnostics cluster: detailed fault byte + capabilities.
-     * 0xFC00 is in the manufacturer-specific cluster range, so the attributes
-     * MUST be registered manufacturer-specific (under TP_MANUF_CODE) — that is
-     * how Zigbee2MQTT/zigbee-herdsman frames reads and writes to this cluster.
-     * Registering them plain makes every read return nothing and every write
-     * fail with NOT_AUTHORIZED. */
-    esp_zb_attribute_list_t *diag = esp_zb_zcl_attr_list_create(TP_DIAG_CLUSTER_ID);
-    /* Plain (non-manufacturer) custom attributes — this is the canonical pattern
-     * and, crucially, what gets the cluster emitted into the simple descriptor.
-     * A custom cluster whose attributes are ALL manufacturer-specific is dropped
-     * from the descriptor (z2m then reports "has no input cluster"). No REPORTING
-     * flag: nothing configures reporting info here; z2m reads these on demand
-     * (STATE_GET) and the live fault alarm reports via genBinaryInput. */
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_FAULT_RAW, ESP_ZB_ZCL_ATTR_TYPE_8BITMAP,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_fault_raw);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_RTD_WIRES, ESP_ZB_ZCL_ATTR_TYPE_U8,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_wires);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_RTD_NOMINAL, ESP_ZB_ZCL_ATTR_TYPE_U16,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_nominal);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_RTD_REF, ESP_ZB_ZCL_ATTR_TYPE_U16,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_ref);
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_FILTER_50HZ, ESP_ZB_ZCL_ATTR_TYPE_BOOL,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_diag_filter50);
-    /* Writable: EMA smoothing weight (alpha x 1000, 1..1000). */
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_EMA_ALPHA, ESP_ZB_ZCL_ATTR_TYPE_U16,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &s_diag_ema_permille);
-    /* Writable: select antenna over Zigbee (1 = external U.FL, 0 = ceramic). */
-    esp_zb_custom_cluster_add_custom_attr(diag, TP_DIAG_ATTR_ANTENNA, ESP_ZB_ZCL_ATTR_TYPE_BOOL,
-                                          ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &s_diag_antenna_ext);
-    ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(clusters, diag, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
-
-    esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
-    esp_zb_endpoint_config_t ep_cfg = {
-        .endpoint = HA_TEMP_SENSOR_ENDPOINT,
-        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id = ESP_ZB_HA_TEMPERATURE_SENSOR_DEVICE_ID,
-        .app_device_version = 0,
-    };
-    ESP_ERROR_CHECK(esp_zb_ep_list_add_ep(ep_list, clusters, ep_cfg));
-    return ep_list;
-}
-
-/* ------------------------------------------------------------------------- */
-/* Commissioning helpers                                                       */
-/* ------------------------------------------------------------------------- */
-static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
-{
-    ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, ,
-                        TAG, "Failed to start Zigbee commissioning");
-}
-
-void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
-{
-    uint32_t *p_sg_p = signal_struct->p_app_signal;
-    esp_err_t err_status = signal_struct->esp_err_status;
-    esp_zb_app_signal_type_t sig_type = *p_sg_p;
-
-    switch (sig_type) {
-    case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
-        ESP_LOGI(TAG, "Initialize Zigbee stack");
-        esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_INITIALIZATION);
-        break;
-    case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
-    case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
-        if (err_status == ESP_OK) {
-            ESP_LOGI(TAG, "Deferred driver init %s",
-                     deferred_driver_init() == ESP_OK ? "OK" : "FAILED");
-            ESP_LOGI(TAG, "Device started in %s factory-reset mode",
-                     esp_zb_bdb_is_factory_new() ? "" : "non-");
-            if (esp_zb_bdb_is_factory_new()) {
-                ESP_LOGI(TAG, "Start network steering");
-                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
-            } else {
-                ESP_LOGI(TAG, "Device rebooted, already on a network");
-                s_joined = true;
-            }
-        } else {
-            ESP_LOGW(TAG, "Failed to start Zigbee stack (status: %s)", esp_err_to_name(err_status));
-        }
-        break;
-    case ESP_ZB_BDB_SIGNAL_STEERING:
-        if (err_status == ESP_OK) {
-            esp_zb_ieee_addr_t ext_pan_id;
-            esp_zb_get_extended_pan_id(ext_pan_id);
-            ESP_LOGI(TAG,
-                     "Joined network (Ext PAN ID: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x, "
-                     "PAN ID: 0x%04hx, Channel: %d, Short Addr: 0x%04hx)",
-                     ext_pan_id[7], ext_pan_id[6], ext_pan_id[5], ext_pan_id[4],
-                     ext_pan_id[3], ext_pan_id[2], ext_pan_id[1], ext_pan_id[0],
-                     esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
-            s_joined = true;
-        } else {
-            ESP_LOGI(TAG, "Network steering failed (status: %s), retrying", esp_err_to_name(err_status));
-            esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
-                                   ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
-        }
-        break;
-    default:
-        ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s",
-                 esp_zb_zdo_signal_to_string(sig_type), sig_type, esp_err_to_name(err_status));
-        break;
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Attribute write handler: a remote write to the antenna attribute switches    */
-/* the RF path live and persists the choice.                                    */
-/* ------------------------------------------------------------------------- */
-static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
-{
-    ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty attribute message");
-    ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG,
-                        TAG, "Attribute write error status(%d)", message->info.status);
-
-    if (message->info.dst_endpoint == HA_TEMP_SENSOR_ENDPOINT &&
-        message->info.cluster == TP_DIAG_CLUSTER_ID &&
-        message->attribute.data.value) {
-        if (message->attribute.id == TP_DIAG_ATTR_ANTENNA &&
-            message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL) {
-            antenna_set(*(bool *)message->attribute.data.value);
-        } else if (message->attribute.id == TP_DIAG_ATTR_EMA_ALPHA &&
-                   message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U16) {
-            ema_alpha_set(*(uint16_t *)message->attribute.data.value);
-        }
-    }
-    return ESP_OK;
-}
-
-static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message)
-{
-    switch (callback_id) {
-    case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
-        return zb_attribute_handler((const esp_zb_zcl_set_attr_value_message_t *)message);
-    default:
-        ESP_LOGI(TAG, "Unhandled Zigbee action callback 0x%x", callback_id);
-        return ESP_OK;
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Factory-reset pushbutton: hold the active-LOW button (XIAO BOOT/GPIO9 by    */
-/* default) for CONFIG_TP_FACTORY_RESET_HOLD_MS, then release, to erase the     */
-/* Zigbee NVRAM and reboot factory-new so the device re-commissions cleanly.    */
-/* Triggering on release (not while held) avoids re-entering the bootloader     */
-/* download mode via the GPIO9 strapping pin during the reboot.                 */
+/* Factory-reset pushbutton: hold to erase persisted runtime config + reboot.  */
 /* ------------------------------------------------------------------------- */
 static void factory_reset_button_task(void *arg)
 {
@@ -728,16 +574,22 @@ static void factory_reset_button_task(void *arg)
     int held_ms = 0;
     bool announced = false;
     while (1) {
-        if (gpio_get_level(pin) == 0) {            /* pressed (active LOW) */
+        if (gpio_get_level(pin) == 0) {
             held_ms += poll_ms;
             if (held_ms >= CONFIG_TP_FACTORY_RESET_HOLD_MS && !announced) {
                 announced = true;
-                ESP_LOGW(TAG, "Factory-reset threshold reached; release button to erase & reboot");
+                ESP_LOGW(TAG, "Factory-reset threshold reached; release to erase & reboot");
             }
         } else {
             if (held_ms >= CONFIG_TP_FACTORY_RESET_HOLD_MS) {
-                ESP_LOGW(TAG, "Factory reset: erasing Zigbee NVRAM and rebooting");
-                esp_zb_factory_reset();            /* erases NVRAM + reboots */
+                ESP_LOGW(TAG, "Factory reset: erasing persisted config and rebooting");
+                nvs_handle_t h;
+                if (nvs_open(TP_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+                    nvs_erase_all(h);
+                    nvs_commit(h);
+                    nvs_close(h);
+                }
+                esp_restart();
             }
             held_ms = 0;
             announced = false;
@@ -747,53 +599,68 @@ static void factory_reset_button_task(void *arg)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Zigbee main task                                                            */
-/* ------------------------------------------------------------------------- */
-static void esp_zb_task(void *pvParameters)
+static void build_topics(void)
 {
-    esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZR_CONFIG();
-    esp_zb_init(&zb_nwk_cfg);
+    if (strlen(CONFIG_TP_DEVICE_ID) > 0) {
+        snprintf(s_node_id, sizeof(s_node_id), "%s", CONFIG_TP_DEVICE_ID);
+    } else {
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        snprintf(s_node_id, sizeof(s_node_id), "tempprobe_%02x%02x%02x", mac[3], mac[4], mac[5]);
+    }
 
-    /* Advertise our manufacturer code in the node descriptor so it matches the
-     * code the manufacturer-specific diag attributes are registered under (and
-     * that z2m frames reads/writes with). Without this the device defaults to
-     * Espressif's 0x131B, mismatching TP_MANUF_CODE, and every manufacturer-
-     * specific read/write to the 0xFC00 cluster is silently rejected. */
-    esp_zb_set_node_descriptor_manufacturer_code(TP_MANUF_CODE);
+    char base[64];
+    snprintf(base, sizeof(base), "%s/%s", CONFIG_TP_MQTT_TOPIC_PREFIX, s_node_id);
+    snprintf(t_status,      sizeof(t_status),      "%s/status", base);
+    snprintf(t_temp,        sizeof(t_temp),        "%s/temperature", base);
+    snprintf(t_temp_status, sizeof(t_temp_status), "%s/temperature/status", base);
+    snprintf(t_fault,       sizeof(t_fault),       "%s/fault", base);
+    snprintf(t_fault_raw,   sizeof(t_fault_raw),   "%s/fault_raw", base);
+    snprintf(t_wires,       sizeof(t_wires),       "%s/rtd_wires", base);
+    snprintf(t_nominal,     sizeof(t_nominal),     "%s/rtd_nominal", base);
+    snprintf(t_ref,         sizeof(t_ref),         "%s/rtd_ref", base);
+    snprintf(t_filter,      sizeof(t_filter),      "%s/filter_hz", base);
+    snprintf(t_alpha,       sizeof(t_alpha),       "%s/alpha", base);
+    snprintf(t_alpha_set,   sizeof(t_alpha_set),   "%s/alpha/set", base);
+    snprintf(t_ant,         sizeof(t_ant),         "%s/antenna", base);
+    snprintf(t_ant_set,     sizeof(t_ant_set),     "%s/antenna/set", base);
 
-    esp_zb_ep_list_t *ep_list = build_endpoint();
+    build_device_json();
+}
 
-    zcl_basic_manufacturer_info_t info = {
-        .manufacturer_name = ESP_MANUFACTURER_NAME,
-        .model_identifier = ESP_MODEL_IDENTIFIER,
+static esp_err_t rtd_init(void)
+{
+    max31865_config_t cfg = {
+        .host = SPI2_HOST,
+        .sclk_gpio = CONFIG_TP_SPI_SCLK_GPIO,
+        .miso_gpio = CONFIG_TP_SPI_MISO_GPIO,
+        .mosi_gpio = CONFIG_TP_SPI_MOSI_GPIO,
+        .cs_gpio = CONFIG_TP_SPI_CS_GPIO,
+        .clock_hz = CONFIG_TP_SPI_CLOCK_HZ,
+        .wires = TP_WIRES,
+        .filter_50hz = CONFIG_TP_RTD_FILTER_50HZ,
+        .rtd_nominal_ohms = (float)CONFIG_TP_RTD_NOMINAL_OHMS,
+        .ref_ohms = (float)CONFIG_TP_RTD_REF_OHMS,
     };
-    esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, HA_TEMP_SENSOR_ENDPOINT, &info);
-
-    esp_zb_device_register(ep_list);
-    esp_zb_core_action_handler_register(zb_action_handler);
-    configure_reporting();
-
-    esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
-    ESP_ERROR_CHECK(esp_zb_start(false));
-    xTaskCreate(factory_reset_button_task, "fct_btn", 2560, NULL, 4, NULL);
-    esp_zb_stack_main_loop();
+    return max31865_init(&cfg, &s_rtd);
 }
 
 void app_main(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
 
-    /* Load persisted settings before the endpoint is registered / radio is up. */
-    ema_alpha_load();
-
-    /* Antenna routing must be set before the radio comes up. */
+    prefs_load();
     configure_antenna();
+    build_topics();
+    ESP_LOGI(TAG, "Node id: %s", s_node_id);
 
-    esp_zb_platform_config_t config = {
-        .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
-        .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
-    };
-    ESP_ERROR_CHECK(esp_zb_platform_config(&config));
+    ESP_ERROR_CHECK(rtd_init());
+    xTaskCreate(sensor_task, "rtd_sample", 4096, NULL, 5, NULL);
+    xTaskCreate(factory_reset_button_task, "fct_btn", 2560, NULL, 4, NULL);
 
-    xTaskCreate(esp_zb_task, "zb_main", 4096, NULL, 5, NULL);
+    wifi_start();
 }
